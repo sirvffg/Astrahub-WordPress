@@ -4,7 +4,7 @@ Tags: friend-links, blogroll, link-exchange, webring, rss
 Requires at least: 6.0
 Tested up to: 6.7
 Requires PHP: 8.0
-Stable tag: 0.1.6
+Stable tag: 0.1.7
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -92,6 +92,11 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
 == Changelog ==
 
+= 0.1.7 =
+* 修复“全部”筛选中同一邀请同时出现在 inbox/outbox 时方向被覆盖，导致待审核邀请操作异常的问题。
+* 待审核操作按钮拆分为独立的“通过”和“拒绝”渲染条件，避免只显示单个按钮。
+* 微调操作列宽与按钮内边距，保证两个按钮同排显示且不被裁切。
+
 = 0.1.6 =
 * 修复友链管理待审核邀请“通过 / 拒绝”按钮宽度与其他操作按钮不一致的问题。
 * 操作列布局回到与 Typecho 端一致的自然按钮宽度，避免按钮被固定拉宽。
@@ -124,6 +129,9 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 * 首个版本：站点接入星链网络、友链同步与对账、友链星球浏览、在线交换友链、3D 关系图谱、RSS 资讯聚合、前台吉祥物挂件（可选）。
 
 == Upgrade Notice ==
+
+= 0.1.7 =
+修复友链管理待审核邀请只显示“拒绝”按钮的问题，并确保“通过 / 拒绝”同排显示。
 
 = 0.1.6 =
 修复友链管理待审核邀请按钮样式，使“通过 / 拒绝”和其他操作按钮保持一致。
