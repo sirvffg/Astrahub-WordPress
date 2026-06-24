@@ -4,7 +4,7 @@ Tags: friend-links, blogroll, link-exchange, webring, rss
 Requires at least: 6.0
 Tested up to: 6.7
 Requires PHP: 8.0
-Stable tag: 0.1.4
+Stable tag: 0.1.5
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -92,6 +92,9 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
 == Changelog ==
 
+= 0.1.5 =
+* 修复友链管理待审核邀请在 WordPress 后台缓存旧资源时仍只显示“拒绝”的问题，升级资源版本并固定显示“同意 / 拒绝”双按钮。
+
 = 0.1.4 =
 * 根治“我已关注”单向删除刷新后回弹：删除单向关注时只移除本站 -> 对方的关系边，不再走双方解除关系。
 * “我已关注”删除不会再发送解除关系邮件；只有互相关注的“解除关系”才通知对方。
@@ -117,6 +120,9 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 * 首个版本：站点接入星链网络、友链同步与对账、友链星球浏览、在线交换友链、3D 关系图谱、RSS 资讯聚合、前台吉祥物挂件（可选）。
 
 == Upgrade Notice ==
+
+= 0.1.5 =
+建议所有 0.1.4 用户升级。此版本刷新后台资源版本，确保友链管理待审核邀请稳定显示“同意 / 拒绝”两个按钮。
 
 = 0.1.4 =
 建议所有 0.1.3 用户升级。此版本将“删除我单向关注的友链”和“解除互相关注关系”拆成两个独立动作，避免刷新回弹和误发邮件。
