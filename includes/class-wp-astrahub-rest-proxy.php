@@ -668,7 +668,7 @@ class WP_AstraHub_Rest_Proxy {
             array(
                 'success' => false,
                 'status'  => 400,
-                'message' => 'not registered yet',
+                'message' => '当前站点未注册，暂时无法读取友链邀请',
                 'data'    => array(),
             ),
             400
