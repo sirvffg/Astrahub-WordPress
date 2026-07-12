@@ -363,7 +363,7 @@ export async function fetchWorldChatMemberRecentPosts(siteId: string, limit = 5)
 }
 
 export function worldChatStickerFileUrl(stickerId: string) {
-  return restResourceUrl(`/world-chat/stickers/${encodeURIComponent(stickerId)}/file`);
+  return restResourceUrl(`/v1/world-chat/stickers/${encodeURIComponent(stickerId)}/file`);
 }
 
 export async function fetchWorldChatStickers() {

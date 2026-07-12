@@ -4,7 +4,7 @@ Tags: friend-links, blogroll, link-exchange, webring, rss
 Requires at least: 6.0
 Tested up to: 6.7
 Requires PHP: 8.0
-Stable tag: 0.2.0
+Stable tag: 0.2.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -91,6 +91,9 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 4. 接入配置：站点接入、同步状态与前台显示开关。
 
 == Changelog ==
+
+= 0.2.1 =
+* 修复贴图文件 403 错误：修正 `worldChatStickerFileUrl` 路径前缀，添加 `/v1/` 以通过服务端路径白名单校验。
 
 = 0.2.0 =
 * 重构星际通讯面板界面，与 Halo 端界面逻辑和视觉风格完全对齐：新增星链成员侧栏、首次使用同意门、提及/引用快捷菜单、成员资料弹窗、表情包管理等。
