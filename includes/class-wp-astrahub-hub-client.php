@@ -1,6 +1,6 @@
 <?php
 /**
- * AstraHub Hub HTTP 客户端。
+ * Hub HTTP 客户端。
  *
  * 负责：
  *   - 拼接 Hub 基础地址（WP_ASTRAHUB_HUB_BASE_URL）与请求路径。
@@ -10,6 +10,12 @@
  * 签名所用 PATH 为「解码后路径」（与 Go r.URL.Path 对齐）；带 query 的 GET 请求，
  * query 不参与签名，仅拼接到实际请求 URL。
  *
+ * 与 Halo AstraHubNodeSelector.sendString 完全对齐：
+ *   - 常规请求：ordered_candidates() 排序后依次尝试，failover 在 408/502/503/504/3xx 时触发。
+ *   - boarding 端点：强制用 base_url() 单节点。原因是 Hub boarding code 存储在 Go
+ *     进程内内存 map（boardingcoderuntime.Manager.codes），send-code 和 restore 必须命中
+ *     同一个 Hub 实例。NodeSelector.currentNode() 在 1h TTL 内稳定，与 Halo 行为一致。
+ *
  * @package WPAstraHub
  */
 
@@ -18,6 +24,16 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 class WP_AstraHub_Hub_Client {
+
+    /**
+     * 必须命中同一 Hub 节点的请求路径前缀（Hub 侧有进程内内存状态）。
+     * 这些路径不走多节点 failover，固定用 base_url()。
+     *
+     * @var string[]
+     */
+    private const STICKY_PATH_PREFIXES = array(
+        '/v1/sites/boarding/',
+    );
 
     /**
      * 凭据存储。
@@ -155,8 +171,11 @@ class WP_AstraHub_Hub_Client {
         // 调用方额外头优先级最高（覆盖）。
         $request_headers = array_merge( $request_headers, $headers );
 
-        // 确定候选节点列表（用于 failover）。
-        $candidates = $this->candidate_nodes();
+        // 确定候选节点列表（用于 failover）。boarding 等有节点内内存状态的路径
+        // 强制用 base_url() 单节点——因为 Hub boarding code 存储在 Go 进程内内存
+        // map，send-code 和 restore 必须命中同一个实例。
+        $candidates = $this->candidate_nodes( $path );
+
         $last_result = null;
 
         foreach ( $candidates as $node ) {
@@ -250,13 +269,36 @@ class WP_AstraHub_Hub_Client {
     /**
      * 本次请求可尝试的节点列表（failover 顺序）。
      *
+     * 与 Halo AstraHubNodeSelector.sendString 完全对齐：
+     *   - 普通端点：ordered_candidates() 排序后依次尝试
+     *   - boarding 端点：只返回 base_url() 单节点（与 Halo 用 currentNode() 效果一致）
+     *
+     * @param string $path 请求路径。
      * @return string[]
      */
-    private function candidate_nodes() {
-        if ( $this->node_selector ) {
-            return $this->node_selector->ordered_candidates();
+    private function candidate_nodes( $path = '' ) {
+        if ( $this->is_sticky_path( $path ) || ! $this->node_selector ) {
+            return array( $this->base_url() );
         }
-        return array( $this->base_url() );
+        return $this->node_selector->ordered_candidates();
+    }
+
+    /**
+     * 判断路径是否必须命中同一 Hub 节点（Hub 侧有进程内内存状态）。
+     *
+     * @param string $path 请求路径。
+     * @return bool
+     */
+    private function is_sticky_path( $path ) {
+        if ( '' === $path ) {
+            return false;
+        }
+        foreach ( self::STICKY_PATH_PREFIXES as $prefix ) {
+            if ( 0 === strpos( $path, $prefix ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

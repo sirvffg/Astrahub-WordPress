@@ -571,7 +571,7 @@ class WP_AstraHub_Rest_Proxy {
      * 关系图头像代理：服务端拉取远端头像后同源回传，避免 3D canvas 被跨域图片污染。
      *
      * 安全：仅允许 http/https 的公网图片 URL；拒绝内网/环回地址（SSRF）；限制响应体大小与
-     * content-type 必须为 image/*。失败时返回 1x1 透明 PNG，让前端 onerror 回退到默认头像。
+     * content-type 必须为 image/*。失败返回非 2xx 状态，触发前端头像错误处理。
      *
      * @param WP_REST_Request $request 请求（query: url）。
      * @return WP_REST_Response
@@ -579,35 +579,36 @@ class WP_AstraHub_Rest_Proxy {
     public function handle_graph_avatar( WP_REST_Request $request ) {
         $url = trim( (string) $request->get_param( 'url' ) );
         if ( '' === $url || ! $this->is_safe_remote_image_url( $url ) ) {
-            return $this->blank_avatar_response();
+            return new WP_Error( 'astrahub_avatar_unavailable', '头像加载失败', array( 'status' => 502 ) );
         }
 
-        $response = wp_remote_get(
+        $response = wp_safe_remote_get(
             $url,
             array(
                 'timeout'     => 8,
                 'redirection' => 2,
+                'limit_response_size' => 2097153,
                 'headers'     => array( 'Accept' => 'image/*' ),
             )
         );
         if ( is_wp_error( $response ) ) {
-            return $this->blank_avatar_response();
+            return new WP_Error( 'astrahub_avatar_unavailable', '头像加载失败', array( 'status' => 502 ) );
         }
 
         $code = (int) wp_remote_retrieve_response_code( $response );
         if ( $code < 200 || $code >= 300 ) {
-            return $this->blank_avatar_response();
+            return new WP_Error( 'astrahub_avatar_unavailable', '头像加载失败', array( 'status' => 502 ) );
         }
 
         $content_type = (string) wp_remote_retrieve_header( $response, 'content-type' );
         if ( 0 !== strpos( strtolower( $content_type ), 'image/' ) ) {
-            return $this->blank_avatar_response();
+            return new WP_Error( 'astrahub_avatar_unavailable', '头像加载失败', array( 'status' => 502 ) );
         }
 
         $body = wp_remote_retrieve_body( $response );
         // 上限 2MB，避免被拖大响应。
         if ( '' === $body || strlen( $body ) > 2097152 ) {
-            return $this->blank_avatar_response();
+            return new WP_Error( 'astrahub_avatar_unavailable', '头像加载失败', array( 'status' => 502 ) );
         }
 
         // REST 框架会对返回值做 JSON 序列化，二进制图片必须直接输出原始字节后退出。

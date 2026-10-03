@@ -43,9 +43,18 @@ class WP_AstraHub_Error_Codes {
 		'INVITATION_MARK_USED_FAILED'   => '注册成功但邀请码标记失败，请联系管理员',
 
 		// ── 登舱恢复类 ──────────────────────────────────────
+		'INVALID_EMAIL'                 => '邮箱格式不正确，请检查后重试',
 		'SITE_NOT_FOUND'                => '未找到关联站点，请确认邮箱是否正确',
+		'CODE_COOLDOWN'                 => '验证码发送过于频繁，请稍后再试',
+		'CODE_NOT_SENT'                 => '该邮箱尚未申请验证码，请先发送',
+		'CODE_EXPIRED'                  => '验证码已过期，请重新获取',
+		'CODE_INVALID'                  => '验证码错误，请确认后重新输入',
+		'CODE_EXHAUSTED'                => '验证码错误次数过多，请重新获取',
+		'EMAIL_NOT_CONFIGURED'          => 'Hub 邮件服务暂未配置，请稍后再试',
+		'EMAIL_SEND_FAILED'             => '邮件发送失败，请联系管理员',
+		// 兼容旧名（Hub 历史版本）
 		'BOARDING_CODE_INVALID'         => '验证码错误或已过期，请重新获取',
-		'BOARDING_CODE_LOCKED'          => '验证码错误次数超限，请稍后重新获取',
+		'BOARDING_CODE_LOCKED'          => '验证码错误次数超限，请重新获取',
 
 		// ── 友链邀请类 ──────────────────────────────────────
 		'FRIEND_INVITATION_INVALID_JSON'    => '请求格式异常，请刷新页面后重试',

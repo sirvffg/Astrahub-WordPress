@@ -15,7 +15,8 @@ export type HubInvitationRealtimeEventType =
   | "friend_invitation_deleted"
   | "friend_relation_removed"
   | "site_relation_updated"
-  | "site_profile_updated";
+  | "site_profile_updated"
+  | "realtime_resync_required";
 
 export interface HubRealtimeEvent<T = unknown> {
   id?: string;
@@ -39,19 +40,23 @@ const HUB_INVITATION_REALTIME_EVENT_TYPES = new Set<HubInvitationRealtimeEventTy
   "friend_invitation_deleted",
   "friend_relation_removed",
   "site_relation_updated",
-  "site_profile_updated"
+  "site_profile_updated",
+  "realtime_resync_required"
 ]);
 
 // 世界频道事件类型：本站直接可见，不再检查 siteId 匹配。
 const WORLD_CHAT_EVENT_TYPES = new Set([
   "world_chat_message_created",
   "world_chat_message_updated",
-  "world_chat_mute_updated"
+  "world_chat_mute_updated",
+  "world_chat_member_updated"
 ]);
 
 // 与 Hub 服务端 isRealtimeEventVisibleToSite 同口径：事件是否与本站相关。
 function isRelevantHubEvent(event: HubRealtimeEvent<unknown>, currentSiteId: string): boolean {
   const type = event.type as HubInvitationRealtimeEventType;
+  if (!String(currentSiteId || "").trim()) return false;
+  if (event.type === "realtime_resync_required") return true;
 
   // 世界频道事件：本站直接可见
   if (WORLD_CHAT_EVENT_TYPES.has(event.type)) {
@@ -76,7 +81,7 @@ function isRelevantHubEvent(event: HubRealtimeEvent<unknown>, currentSiteId: str
   if (type === "site_profile_updated") {
     const data = (event.data || {}) as { impactedSiteIds?: string[] };
     const impacted = Array.isArray(data.impactedSiteIds) ? data.impactedSiteIds : [];
-    return impacted.length === 0 || impacted.some((id) => String(id || "").trim() === siteId);
+    return Boolean((event.data as { siteId?: string })?.siteId);
   }
   if (type === "friend_relation_removed") {
     const data = (event.data || {}) as { actorSiteId?: string; peerSiteId?: string };
@@ -106,6 +111,8 @@ export function useFriendInvitationRealtime(
   siteId: Ref<string>,
   onRelevantEvent: (event: HubRealtimeEvent<unknown>) => void
 ) {
+  let generation = 0;
+  let connecting = false;
   let socket: WebSocket | null = null;
   let eventSource: EventSource | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -184,16 +191,18 @@ export function useFriendInvitationRealtime(
   };
 
   const connectSSE = async (base: string, currentSiteId: string) => {
+    const attempt = generation;
     let token = "";
     try {
       const result = await issueRealtimeToken();
       token = String(result.token || "").trim();
     } catch {
-      if (!stopped) {
+      if (!stopped && attempt === generation) {
         scheduleReconnect();
       }
       return;
     }
+    if (attempt !== generation) return;
     if (stopped || !token) {
       if (!token && !stopped) {
         scheduleReconnect();
@@ -207,6 +216,7 @@ export function useFriendInvitationRealtime(
     }
     const es = new EventSource(sseUrl);
     eventSource = es;
+    es.onopen = () => { if (eventSource === es) onRelevantEvent({ type: "realtime_resync_required" }); };
     es.onmessage = (messageEvent) => {
       onEventData(String(messageEvent.data));
     };
@@ -221,16 +231,18 @@ export function useFriendInvitationRealtime(
   };
 
   const connectWS = async (base: string, currentSiteId: string) => {
+    const attempt = generation;
     let token = "";
     try {
       const result = await issueRealtimeToken();
       token = String(result.token || "").trim();
     } catch {
-      if (!stopped) {
+      if (!stopped && attempt === generation) {
         scheduleReconnect();
       }
       return;
     }
+    if (attempt !== generation) return;
     if (stopped || !token) {
       if (!token && !stopped) {
         scheduleReconnect();
@@ -248,16 +260,17 @@ export function useFriendInvitationRealtime(
 
     // WS 超时计时器：5 秒内未 open 则回退到 SSE
     wsTimeoutTimer = setTimeout(() => {
-      if (ws.readyState !== WebSocket.OPEN) {
-        ws.close();
-        socket = null;
+      if (socket === ws && ws.readyState !== WebSocket.OPEN) {
+        closeSocket();
         useFallback = true;
-        void connect();
+        scheduleReconnect();
       }
     }, WS_TIMEOUT_MS);
 
     ws.onopen = () => {
+      if (socket !== ws) return;
       clearWsTimeoutTimer();
+      onRelevantEvent({ type: "realtime_resync_required" });
     };
 
     ws.onmessage = (messageEvent) => {
@@ -267,14 +280,17 @@ export function useFriendInvitationRealtime(
     ws.onclose = () => {
       socket = null;
       clearWsTimeoutTimer();
-      if (!stopped) {
+      if (!stopped && attempt === generation) {
         scheduleReconnect();
       }
     };
 
     ws.onerror = () => {
+      if (socket !== ws) return;
       clearWsTimeoutTimer();
       closeSocket();
+      useFallback = true;
+      if (!stopped) scheduleReconnect();
     };
   };
 
@@ -283,7 +299,7 @@ export function useFriendInvitationRealtime(
       return;
     }
     // 避免重复连接
-    if (socket || eventSource) {
+    if (connecting || socket || eventSource) {
       return;
     }
     const base = String(hubBaseUrl.value || "").trim();
@@ -292,14 +308,19 @@ export function useFriendInvitationRealtime(
       return;
     }
 
-    if (useFallback) {
-      await connectSSE(base, currentSiteId);
-    } else {
-      await connectWS(base, currentSiteId);
+    connecting = true;
+    const attempt = generation;
+    try {
+      if (useFallback) await connectSSE(base, currentSiteId);
+      else await connectWS(base, currentSiteId);
+    } finally {
+      if (attempt === generation) connecting = false;
     }
   };
 
   const reconnect = () => {
+    generation++;
+    connecting = false;
     stopped = false;
     useFallback = false;
     lastEventId = "";
@@ -311,6 +332,8 @@ export function useFriendInvitationRealtime(
   };
 
   const stop = () => {
+    generation++;
+    connecting = false;
     stopped = true;
     clearReconnectTimer();
     clearWsTimeoutTimer();

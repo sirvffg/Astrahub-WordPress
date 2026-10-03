@@ -1,19 +1,16 @@
 <script lang="ts" setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import ForceGraph3D, { type ForceGraph3DInstance } from "3d-force-graph";
 import * as THREE from "three";
-import { graphAvatarProxyUrl } from "../api/client";
+import { DEFAULT_AVATAR_DATA_URI } from "../data/defaultAvatar";
+import EmptyState from "./EmptyState.vue";
 import { useStatus } from "../composables/useStatus";
+import { graphAvatarProxyUrl } from "../api/client";
 import {
   useRelationGraph,
   type GraphCanvasEdge,
   type GraphCanvasNode,
 } from "../composables/useRelationGraph";
-
-// 默认头像（深蓝星球 SVG），对齐 Halo 端 data/defaultAvatar 的内联常量。
-const DEFAULT_AVATAR_DATA_URI = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(
-  `<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg"><path d="M512 512m-512 0a512 512 0 1 0 1024 0 512 512 0 1 0-1024 0Z" fill="#1A4066"/><path d="M512 300a150 150 0 1 0 0 300 150 150 0 0 0 0-300zM330 760a182 182 0 0 1 364 0z" fill="#CBD5D8"/></svg>`
-)}`;
 
 const props = defineProps<{
   refreshSignal?: number;
@@ -53,13 +50,16 @@ interface ForceLink {
 
 const canvasRef = ref<HTMLDivElement | null>(null);
 const wrapRef = ref<HTMLDivElement | null>(null);
+let disposed = false;
 let graph: ForceGraph3DInstance<ForceNode, ForceLink> | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let decorStars: THREE.Points | null = null;
 const NODE_BOUNDARY_RADIUS = 200;
 const NODE_SPAWN_RADIUS = NODE_BOUNDARY_RADIUS * 0.45;
+let suppressNextFocusFlight = false;
 
 const credentialReady = computed(() => Boolean(credentials.value.siteId));
+const renderStarted = ref(false);
 const isFullscreen = ref(false);
 const autoRotate = ref(true);
 const selectedNode = ref<GraphCanvasNode | null>(null);
@@ -98,8 +98,18 @@ const searchSuggestions = computed<GraphCanvasNode[]>(() => {
 });
 
 function buildSuggestionAvatarSrc(node: GraphCanvasNode): string {
-  if (!node.avatar) return DEFAULT_AVATAR_DATA_URI;
-  return graphAvatarProxyUrl(node.avatar);
+  return buildNodeAvatarSrc(node);
+}
+
+function buildNodeAvatarSrc(node: GraphCanvasNode): string {
+  const avatar = String(node.avatar || "").trim();
+  if (!avatar) return DEFAULT_AVATAR_DATA_URI;
+  const approvedSubmission = String(node.raw?.id || "").trim().startsWith("submission:");
+  if (node.kind === "unregistered" && !approvedSubmission) {
+    // 未接入友链由管理员浏览器直接加载；拒绝 http，避免 HTTPS 控制台混合内容。
+    return /^https:\/\//i.test(avatar) ? avatar : DEFAULT_AVATAR_DATA_URI;
+  }
+  return graphAvatarProxyUrl(avatar);
 }
 
 function onSuggestionAvatarError(event: Event) {
@@ -133,25 +143,25 @@ function resetToOverview() {
   hoveredNodeId.value = null;
   searchQuery.value = "";
   searchOpen.value = false;
+  centerOverview(800);
+}
+
+function centerOverview(duration = 0) {
   if (!graph) return;
   graph.cameraPosition(
     { x: 0, y: 0, z: NODE_BOUNDARY_RADIUS * 2.6 },
     { x: 0, y: 0, z: 0 },
-    800
+    duration
   );
 }
 
 onMounted(async () => {
-  if (!canvasRef.value) return;
-  initGraph(canvasRef.value);
   document.addEventListener("fullscreenchange", onFullscreenChange);
   document.addEventListener("mousedown", onSearchDocumentClick);
-  if (credentialReady.value) {
-    await reset(credentials.value.siteId);
-  }
 });
 
 onBeforeUnmount(() => {
+  disposed = true;
   document.removeEventListener("fullscreenchange", onFullscreenChange);
   document.removeEventListener("mousedown", onSearchDocumentClick);
   cancelDetailScreenPos();
@@ -193,17 +203,22 @@ onBeforeUnmount(() => {
 watch(
   () => credentials.value.siteId,
   async (next, prev) => {
-    if (next && next !== prev) {
-      await reset(next);
+    if (renderStarted.value && next !== prev) {
+      await reset(credentials.value.siteId);
     }
   }
 );
+
+let graphDataStale = false;
 
 watch(
   () => props.refreshSignal,
   async (next, prev) => {
     if (typeof next !== "number" || next === prev) return;
-    if (!credentialReady.value) return;
+    if (!renderStarted.value) {
+      graphDataStale = true;
+      return;
+    }
     await reset(credentials.value.siteId);
   }
 );
@@ -211,6 +226,7 @@ watch(
 watch(
   [nodes, edges],
   () => {
+    if (selectedNode.value) selectedNode.value = nodes.value.get(selectedNode.value.id) ?? null;
     if (!graph) return;
     pushDataToGraph();
   },
@@ -220,17 +236,45 @@ watch(
 watch(focusedId, (next) => {
   if (!graph || !next) return;
   refreshLinkVisuals();
+  if (suppressNextFocusFlight) {
+    suppressNextFocusFlight = false;
+    return;
+  }
   flyToNode(next);
 });
 
+async function startRendering() {
+  if (!credentialReady.value || renderStarted.value) return;
+  renderStarted.value = true;
+  suppressNextFocusFlight = true;
+  await nextTick();
+  if (disposed) return;
+  if (canvasRef.value && !graph) {
+    try {
+      initGraph(canvasRef.value);
+    } catch {
+      renderStarted.value = false;
+      error.value = "无法启动 3D 关系图，请检查浏览器是否支持 WebGL 后重试";
+      return;
+    }
+  }
+  if (nodes.value.size === 0 || graphDataStale) {
+    graphDataStale = false;
+    await reset(credentials.value.siteId);
+  } else {
+    pushDataToGraph();
+  }
+  resetToOverview();
+}
+
 function initGraph(container: HTMLDivElement) {
-  graph = new ForceGraph3D<ForceNode, ForceLink>(container, {
+  graph = new ForceGraph3D(container, {
     controlType: "orbit",
     rendererConfig: {
       antialias: true,
       alpha: true,
     },
-  });
+  }) as unknown as ForceGraph3DInstance<ForceNode, ForceLink>;
 
   graph
     .backgroundColor("rgba(0,0,0,0)")
@@ -481,9 +525,12 @@ function buildStarPoint(node: GraphCanvasNode): THREE.Object3D {
   group.add(halo);
 
   const remoteAvatar = node.avatar;
-  if (remoteAvatar) {
+  // WebGL 纹理需要远端 CORS 授权。未接入友链不走服务器代理时使用默认纹理，
+  // 其真实头像仅在普通 img 元素中由浏览器直连，避免 Halo 服务器产生出站流量。
+  const approvedSubmission = String(node.raw?.id || "").trim().startsWith("submission:");
+  if (remoteAvatar && (node.kind !== "unregistered" || approvedSubmission)) {
     void loadAvatarTexture(remoteAvatar, color).then((tex) => {
-      if (!tex) return;
+      if (!tex || disposed) return;
       coreSprite.material.map = tex;
       coreSprite.material.opacity = 1;
       coreSprite.material.needsUpdate = true;
@@ -536,8 +583,8 @@ async function loadAvatarTexture(remoteUrl: string, haloColor: string): Promise<
   const cached = avatarTextureCache.get(remoteUrl);
   if (cached) return cached;
   const proxyUrl = graphAvatarProxyUrl(remoteUrl);
-  const img = await loadImage(proxyUrl).catch(() => loadImage(DEFAULT_AVATAR_DATA_URI));
-  if (!img) return null;
+  const img = (await loadImage(proxyUrl)) || (await loadImage(DEFAULT_AVATAR_DATA_URI));
+  if (!img || disposed) return null;
   const dpr = 2;
   const canvas = document.createElement("canvas");
   canvas.width = BASE_TEXTURE_SIZE * dpr;
@@ -598,22 +645,9 @@ function drawAvatarTile(
 
 function buildNodeLabel(node: GraphCanvasNode): string {
   const safe = (s: string | undefined) => (s ? escapeHtml(s) : "");
-  const tagText =
-    node.kind === "self"
-      ? "我的站点"
-      : node.kind === "registered"
-      ? "已接入"
-      : "未接入";
-  const tagColor =
-    node.kind === "self"
-      ? "#f59e0b"
-      : node.kind === "registered"
-      ? "#60a5fa"
-      : "#94a3b8";
   return `
     <div style="display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;background:rgba(15,23,42,0.78);border:1px solid rgba(148,163,184,0.35);color:#e2e8f0;font-size:12px;font-family:system-ui,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.4);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);">
       <span style="font-weight:700;">${safe(node.title)}</span>
-      <span style="font-size:10px;color:${tagColor};">· ${tagText}</span>
     </div>
   `;
 }
@@ -1016,8 +1050,7 @@ function toggleAutoRotate() {
 
 const selectedAvatarSrc = computed(() => {
   const node = selectedNode.value;
-  if (!node || !node.avatar) return DEFAULT_AVATAR_DATA_URI;
-  return graphAvatarProxyUrl(node.avatar);
+  return node ? buildNodeAvatarSrc(node) : DEFAULT_AVATAR_DATA_URI;
 });
 
 function onDetailAvatarError(event: Event) {
@@ -1116,13 +1149,28 @@ watch(selectedNode, (next) => {
   }
 });
 
-const detailCardStyle = computed<Record<string, string>>(() => {
+const detailCardStyle = computed<Record<string, string | undefined>>(() => {
   const pos = detailScreenPos.value;
   if (!pos || !pos.visible) {
     return { display: "none" };
   }
-  const left = Math.max(12, pos.x + 24);
-  const top = Math.max(12, pos.y - 60);
+  const containerWidth = wrapRef.value?.clientWidth || 0;
+  const containerHeight = wrapRef.value?.clientHeight || 0;
+  const mobile = containerWidth > 0 && containerWidth <= 640;
+  const gap = mobile ? 10 : 12;
+  const cardWidth = mobile ? 210 : 280;
+  const left = mobile
+    ? Math.min(
+        Math.max(gap, pos.x + 14),
+        Math.max(gap, containerWidth - cardWidth - gap)
+      )
+    : Math.max(gap, pos.x + 24);
+  const top = mobile
+    ? Math.min(
+        Math.max(gap, pos.y - 40),
+        Math.max(gap, containerHeight - 160)
+      )
+    : Math.max(gap, pos.y - 60);
   return {
     left: `${left}px`,
     top: `${top}px`,
@@ -1133,24 +1181,23 @@ const detailCardStyle = computed<Record<string, string>>(() => {
 <template>
   <div class="rg-panel">
     <div v-if="!credentialReady" class="rg-empty-static-wrap">
-      <div class="sp-empty-state">
-        <svg class="sp-empty-state-icon" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" width="120" height="120">
-          <path d="M217.0088 482.0912l315.36-64.8v133.2z" fill="#416191"/>
-          <path d="M851.3288 482.0912l-318.96-64.8v133.2zM211.2488 881.6912l321.12 76.32v-419.76l-321.12-52.56z" fill="#5074AE"/>
-          <path d="M853.4888 881.6912l-321.12 76.32v-419.76l321.12-52.56z" fill="#40608F"/>
-          <path d="M532.3688 538.2512l88.56 169.92 318.96-92.88-88.56-133.2z" fill="#4B6F9B"/>
-          <path d="M535.9688 538.2512l-88.56 169.92-318.96-92.88 88.56-133.2z" fill="#6A90C0"/>
-          <path d="M459.44 62c-25.92 11.52-43.2 20.88-52.56 28.08-13.68 11.52-28.08 44.64-40.32 48.24-12.24 4.32 48.24-4.32 68.4-15.84 13.68-7.92 21.6-28.08 24.48-60.48zM869.84 314c-32.4-11.52-56.16-17.28-72-16.56-24.48 1.44-61.2 3.6-72.72-1.44-11.52-5.04 42.48 43.92 75.6 47.52 20.88 2.16 43.92-7.92 69.12-29.52zM354.32 324.08c-18.72 7.92-30.96 15.12-36 20.16-7.92 7.92-20.16 20.16-32.4 24.48-12.24 4.32 32.4 7.92 48.24 0 10.8-5.04 18-20.16 20.16-44.64z" fill="#6A90C0"/>
-        </svg>
-        <div class="sp-empty-state-text">当前站点尚未接入星链，无法加载关系图。</div>
-        <div class="sp-empty-state-hint">请先在「接入配置」完成星链接入。</div>
-      </div>
+      <EmptyState
+        text="当前站点尚未接入星链，无法加载关系图。"
+        hint="请先在「接入配置」完成星链接入。"
+      />
     </div>
 
     <div v-else ref="wrapRef" class="rg-canvas-wrap" :class="{ 'rg-fullscreen': isFullscreen }">
-      <div ref="canvasRef" class="rg-canvas"></div>
+      <div v-if="renderStarted" ref="canvasRef" class="rg-canvas"></div>
 
-      <div class="rg-toolbar">
+      <div v-if="!renderStarted" class="rg-start-overlay">
+        <button class="rg-start-btn" type="button" @click="startRendering">
+          <span class="rg-start-title">开始渲染</span>
+        </button>
+        <p v-if="error" role="alert">{{ error }}</p>
+      </div>
+
+      <div v-if="renderStarted" class="rg-toolbar">
         <div ref="searchWrapRef" class="rg-search">
           <input
             type="text"
@@ -1193,10 +1240,6 @@ const detailCardStyle = computed<Record<string, string>>(() => {
                 <div class="rg-search-item-title">{{ node.title || node.url || "未命名站点" }}</div>
                 <div v-if="node.url" class="rg-search-item-sub">{{ node.url }}</div>
               </div>
-              <span
-                class="rg-search-item-tag"
-                :class="node.kind === 'unregistered' ? 'unregistered' : 'registered'"
-              >{{ node.kind === "unregistered" ? "未接入" : "已接入" }}</span>
             </button>
           </div>
         </div>
@@ -1239,7 +1282,7 @@ const detailCardStyle = computed<Record<string, string>>(() => {
       </div>
 
       <div
-        v-if="selectedNode"
+        v-if="renderStarted && selectedNode"
         class="rg-detail-card"
         :style="detailCardStyle"
       >
@@ -1281,19 +1324,17 @@ const detailCardStyle = computed<Record<string, string>>(() => {
         </div>
       </div>
 
-      <div v-if="showProgress && !error" class="rg-loading">
+      <div v-if="renderStarted && showProgress && !error" class="rg-loading">
         <div class="rg-spinner" aria-hidden="true"></div>
         <div class="rg-loading-text">loading</div>
         <div class="rg-loading-progress">
-          已汇聚 {{ progress.expanded }}/{{ progress.total }}
-          <span v-if="progress.pending > 0">· 待展开 {{ progress.pending }}</span>
-          <span v-if="progress.capped" class="rg-progress-cap">· 已达节点上限</span>
+          正在获取完整关系图
         </div>
       </div>
-      <div v-else-if="error" class="rg-error">
+      <div v-else-if="renderStarted && error" class="rg-error">
         <p>{{ error }}</p>
       </div>
-      <div v-else-if="!loading && nodes.size === 0" class="rg-empty rg-empty-overlay">
+      <div v-else-if="renderStarted && !loading && nodes.size === 0" class="rg-empty rg-empty-overlay">
         <p>主星上还没有为你建立任何友链关系。</p>
         <p>请先把站点的友链同步到主星，然后回来查看。</p>
       </div>
@@ -1305,8 +1346,12 @@ const detailCardStyle = computed<Record<string, string>>(() => {
 .rg-panel {
   display: flex;
   flex: 1;
+  width: 100%;
+  height: 100%;
   min-height: 0;
   padding: 12px;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .rg-canvas-wrap {
@@ -1328,6 +1373,48 @@ const detailCardStyle = computed<Record<string, string>>(() => {
 }
 .rg-canvas { position: absolute; inset: 0; }
 :deep(.rg-canvas canvas) { outline: none; background: transparent; }
+
+.rg-start-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  color: #e2e8f0;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: #02040a;
+}
+.rg-start-btn {
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+  border: 1px solid rgba(148, 163, 184, .25);
+  background: rgba(2, 6, 23, .72);
+  color: #cbd5e1;
+  cursor: pointer;
+  padding: 0 16px;
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
+}
+.rg-start-btn:hover {
+  border-color: rgba(165, 180, 252, .55);
+  background: rgba(2, 6, 23, .9);
+  color: #fff;
+}
+.rg-start-btn:focus-visible {
+  outline: 2px solid rgba(165, 180, 252, .55);
+  outline-offset: 3px;
+}
+.rg-start-title {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .03em;
+  line-height: 1;
+}
 
 .rg-toolbar {
   position: absolute;
@@ -1471,22 +1558,6 @@ const detailCardStyle = computed<Record<string, string>>(() => {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.rg-search-item-tag {
-  flex-shrink: 0;
-  padding: 2px 6px;
-  border-radius: 999px;
-  font-size: 10px;
-  letter-spacing: .02em;
-}
-.rg-search-item-tag.registered {
-  background: rgba(96, 165, 250, .2);
-  color: #93c5fd;
-}
-.rg-search-item-tag.unregistered {
-  background: rgba(148, 163, 184, .18);
-  color: #cbd5e1;
-}
-
 .rg-detail-card {
   position: absolute;
   z-index: 7;
@@ -1625,7 +1696,7 @@ const detailCardStyle = computed<Record<string, string>>(() => {
   flex-direction: column;
   min-height: 360px;
 }
-.rg-empty-static-wrap .sp-empty-state {
+.rg-empty-static-wrap :deep(.sp-empty-state) {
   flex: 1;
   justify-content: center;
 }
@@ -1649,11 +1720,39 @@ const detailCardStyle = computed<Record<string, string>>(() => {
   to { transform: rotate(360deg); }
 }
 
-/* 内联空态（对齐 Halo common/EmptyState.vue） */
-.sp-empty-state{padding:64px 16px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:12px}
-.sp-empty-state-icon{opacity:.4}
-.sp-empty-state-text{font-size:14px;font-weight:600;color:#64748b}
-.sp-empty-state-hint{font-size:12px;color:#94a3b8}
+@media (max-width:640px) {
+  .rg-panel { padding: 8px; }
+  .rg-canvas-wrap { border-radius: 12px; }
+  .rg-start-overlay { padding: 12px; }
+  .rg-start-btn { height: 28px; padding: 0 11px; border-radius: 7px; }
+  .rg-start-title { font-size: 10px; letter-spacing: .02em; }
+  .rg-toolbar { top: 6px; left: 6px; right: 6px; gap: 4px; }
+  .rg-search { flex: 1; min-width: 0; }
+  .rg-tool-btn { width: 26px; height: 26px; border-radius: 6px; }
+  .rg-tool-btn svg { width: 12px; height: 12px; }
+  .rg-search-input { width: 100%; box-sizing: border-box; height: 26px; padding: 0 22px 0 8px; border-radius: 6px; font-size: 9px; }
+  .rg-search-clear { right: 4px; width: 14px; height: 14px; }
+  .rg-search-clear svg { width: 9px; height: 9px; }
+  .rg-search-suggestions { top: calc(100% + 4px); width: 190px; max-height: 220px; padding: 3px; border-radius: 7px; }
+  .rg-search-empty { padding: 8px; font-size: 9px; }
+  .rg-search-item { gap: 6px; padding: 5px 6px; border-radius: 6px; }
+  .rg-search-item-avatar { width: 21px; height: 21px; }
+  .rg-search-item-meta { gap: 1px; }
+  .rg-search-item-title { font-size: 9px; }
+  .rg-search-item-sub { font-size: 7px; }
+  .rg-detail-card { box-sizing: border-box; width: min(210px, calc(100% - 20px)); max-height: 150px; overflow-y: auto; padding: 8px 10px; border-radius: 12px; }
+  .rg-detail-head { gap: 7px; }
+  .rg-detail-avatar { width: 28px; height: 28px; }
+  .rg-detail-meta { gap: 1px; }
+  .rg-detail-title { max-width: 152px; font-size: 10px; }
+  .rg-detail-link { max-width: 152px; font-size: 8px; }
+  .rg-detail-desc { margin-top: 6px; padding: 5px 6px; border-radius: 7px; font-size: 8px; line-height: 1.35; }
+  .rg-detail-row { margin-top: 6px; gap: 5px; font-size: 8px; }
+  .rg-loading,.rg-error,.rg-empty-overlay { gap: 6px; padding: 10px; font-size: 9px; }
+  .rg-spinner { width: 20px; height: 20px; }
+  .rg-loading-text { font-size: 9px; letter-spacing: .06em; }
+  .rg-loading-progress { font-size: 8px; }
+}
 </style>
 
 <style>

@@ -255,7 +255,7 @@ class WP_AstraHub_Rest_Register {
                         'nodeAvatar'  => $creds['nodeAvatar'],
                     ),
                     'connection' => $this->credentials->get_connection(),
-                    'hubBaseUrl' => WP_ASTRAHUB_HUB_BASE_URL,
+                    'hubBaseUrl' => $this->register_service->hub_base_url(),
                 ),
             ),
             200

@@ -69,7 +69,8 @@ async function request<T>(
   method: string,
   path: string,
   body?: Record<string, unknown> | null,
-  query?: Record<string, string>
+  query?: Record<string, string>,
+  signal?: AbortSignal
 ): Promise<ApiEnvelope<T>> {
   const b = bootstrap();
   const qs = new URLSearchParams(query ?? {});
@@ -87,7 +88,7 @@ async function request<T>(
   // 注意：这里**不再设置 X-WP-Nonce header**，因为宝塔/Nginx WAF 对特定路径（friend-invitations、hub/get 等）
   // 带 X-WP-Nonce header 的请求直接返回 nginx 原生 404（请求根本不到 PHP）。
   // WordPress REST 原生同时支持 header 和 query 参数两种鉴权形式，?_wpnonce= 功能完全等价，已在上面注入 URL。
-  const init: RequestInit = { method, headers, credentials: "same-origin" };
+  const init: RequestInit = { method, headers, credentials: "same-origin", signal };
   if (body !== undefined && body !== null) {
     headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(body);
@@ -117,6 +118,7 @@ async function request<T>(
       data: (parsed.data ?? {}) as T
     };
   } catch (e: unknown) {
+    if (signal?.aborted) throw e;
     // 诊断日志：打印实际请求的 URL，方便排查网络/CORS/证书等问题
     const nav = typeof navigator !== "undefined" ? navigator : null;
     const online = nav && "onLine" in nav ? nav.onLine : "unknown";
@@ -138,8 +140,8 @@ export const api = {
   get<T>(path: string, query?: Record<string, string>) {
     return request<T>("GET", path, null, query);
   },
-  post<T>(path: string, body?: Record<string, unknown> | null) {
-    return request<T>("POST", path, body ?? null);
+  post<T>(path: string, body?: Record<string, unknown> | null, signal?: AbortSignal) {
+    return request<T>("POST", path, body ?? null, undefined, signal);
   },
   put<T>(path: string, body?: Record<string, unknown> | null) {
     return request<T>("PUT", path, body ?? null);

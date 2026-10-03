@@ -4,6 +4,7 @@ import { useStatus } from "./composables/useStatus";
 import { fetchFriendInvitations, dispatchSelfCleanupEvent, reconcileFriendInvitation, ackFriendInvitation, type FriendInvitationItem } from "./api/friend";
 import { useFriendInvitationRealtime, type HubRealtimeEvent } from "./composables/useFriendInvitationRealtime";
 import ConnectionPanel from "./components/ConnectionPanel.vue";
+import NodeSwitcher from "./components/NodeSwitcher.vue";
 import PlanetLinksPanel from "./components/PlanetLinksPanel.vue";
 import FriendInvitationPanel from "./components/FriendInvitationPanel.vue";
 import NewsHubPanel from "./components/NewsHubPanel.vue";
@@ -133,7 +134,7 @@ function onRealtimeEvent(event: HubRealtimeEvent<unknown>) {
   const myId = String(credentials.value.siteId || "").trim();
 
   // 世界频道事件：透传给星际通讯面板
-  if (event.type === "world_chat_message_created" || event.type === "world_chat_message_updated" || event.type === "world_chat_mute_updated") {
+  if (event.type === "world_chat_message_created" || event.type === "world_chat_message_updated" || event.type === "world_chat_mute_updated" || event.type === "world_chat_member_updated" || event.type === "realtime_resync_required") {
     friendRealtimeEvent.value = event;
     return;
   }
@@ -215,6 +216,8 @@ onMounted(() => {
         </button>
       </div>
 
+      <NodeSwitcher v-if="!loading && hubBaseUrl" @selected="hubBaseUrl = $event" />
+
       <!-- 四角装饰 -->
       <div class="ah-corner ah-corner-tl"></div>
       <div class="ah-corner ah-corner-tr"></div>
@@ -285,7 +288,7 @@ onMounted(() => {
           <FriendInvitationPanel v-if="!loading && activeNav === 'friendManagement'" :active-tab="friendTab" :realtime-event="friendRealtimeEvent" @pending-inbox-remove="onPendingRemove" />
           <NewsHubPanel v-if="!loading && activeNav === 'news'" :search-query="newsSearch" />
           <RelationGraphPanel v-if="!loading && activeNav === 'relationGraph'" :refresh-signal="relationRefreshSignal" />
-          <StarCommunicationsPanel v-if="!loading && activeNav === 'starComms'" :settings="worldChatSettings" :realtime-event="friendRealtimeEvent" />
+          <StarCommunicationsPanel :key="credentials.siteId" v-if="!loading && activeNav === 'starComms'" :settings="worldChatSettings" :realtime-event="friendRealtimeEvent" />
         </div>
       </div>
     </div>

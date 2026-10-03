@@ -143,67 +143,6 @@ watch(
 const syncing = ref(false);
 const lastSyncResult = ref<ReportStatusView | null>(null);
 
-// —— 多节点管理（对齐 Halo AstraHubNodeSelector + NodeSelectorRouter）——
-interface NodeStatusItem {
-  url: string;
-  status: "healthy" | "unhealthy" | "checking" | "unchecked" | string;
-  latencyMs: number;
-  httpStatus: number;
-  lastCheckedAt: string;
-  lastError: string;
-  selected: boolean;
-}
-interface NodeStatusSnapshotView {
-  currentNode: string;
-  selectedAt: string;
-  expiresAt: string;
-  checking: boolean;
-  nodes: NodeStatusItem[];
-}
-const nodeStatus = ref<NodeStatusSnapshotView | null>(null);
-const nodeChecking = ref(false);
-const nodeSelecting = ref("");
-
-async function loadNodeStatus() {
-  try {
-    const resp = await api.get<NodeStatusSnapshotView>("/node-status");
-    if (resp.success && resp.data) nodeStatus.value = resp.data;
-  } catch { /* 静默失败 */ }
-}
-
-async function refreshNodeStatus() {
-  if (nodeChecking.value) return;
-  nodeChecking.value = true;
-  try {
-    const resp = await api.post<NodeStatusSnapshotView>("/node-status/refresh");
-    showToast(resp.success ? "ok" : "err", resp.message || (resp.success ? "节点检测完成" : "检测失败"));
-    if (resp.success && resp.data) nodeStatus.value = resp.data;
-  } catch (e) {
-    showToast("err", e instanceof Error ? e.message : "检测失败");
-  } finally {
-    nodeChecking.value = false;
-  }
-}
-
-async function selectNode(url: string) {
-  if (nodeSelecting.value) return;
-  nodeSelecting.value = url;
-  try {
-    const resp = await api.post<NodeStatusSnapshotView>("/node-selection", { url });
-    showToast(resp.success ? "ok" : "err", resp.message || (resp.success ? "已切换节点" : "切换失败"));
-    if (resp.success && resp.data) nodeStatus.value = resp.data;
-  } catch (e) {
-    showToast("err", e instanceof Error ? e.message : "切换失败");
-  } finally {
-    nodeSelecting.value = "";
-  }
-}
-
-// 安全提取 URL 的 hostname，避免模板里 new URL() 抛 TypeError 把整个组件带崩。
-function safeHostname(url: string | undefined | null): string {
-  if (!url) return "-";
-  try { return new URL(url).hostname || url; } catch { return url; }
-}
 
 function statusLabel(code: number): string {
   if (code >= 200 && code < 300) return "成功";
@@ -462,7 +401,6 @@ async function onCopyApiKey() {
 onMounted(() => {
   void refreshReportStatus(true);
   void loadWidgetSettings();
-  void loadNodeStatus();
 });
 
 // —— 前台显示 / 主星实时播报 开关（对齐 Halo settings.widget.enabled / realtimeBroadcast.enabled）——
@@ -556,61 +494,6 @@ watch(
         <div class="sp-form-grid-2">
           <div class="sp-form-item"><label class="sp-form-label">星链头像链接</label><input v-model="form.siteNodeAvatar" :class="['sp-input', { 'sp-input-error': fieldErrors.siteNodeAvatar }]" placeholder="https://example.com/avatar.png" @input="clearFieldError('siteNodeAvatar')" /></div>
           <div class="sp-form-item"><label class="sp-form-label">站点 RSS</label><input v-model="form.siteRssUrl" :class="['sp-input', { 'sp-input-error': fieldErrors.siteRssUrl }]" placeholder="https://your-site.com/rss.xml" @input="clearFieldError('siteRssUrl')" /></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Hub 多节点管理（对齐 Halo AstraHubNodeSelector） -->
-    <div class="sp-card sp-card--violet">
-      <div class="sp-card-title">
-        <div class="sp-card-title-main">
-          <span class="sp-dot" style="background:#8b5cf6"></span>
-          <span>Hub 节点</span>
-          <span v-if="nodeStatus" class="sp-title-separator">·</span>
-          <span v-if="nodeStatus?.currentNode" class="sp-status-pill ok" :title="nodeStatus.currentNode">当前：{{ safeHostname(nodeStatus.currentNode) }}</span>
-          <span v-else-if="nodeStatus" class="sp-status-pill pending">所有节点不可达</span>
-        </div>
-        <div class="sp-title-actions">
-          <button class="sp-header-btn" :disabled="nodeChecking || nodeStatus?.checking" @click="refreshNodeStatus">
-            {{ nodeChecking ? "检测中..." : "重新检测" }}
-          </button>
-        </div>
-      </div>
-      <div class="sp-card-body">
-        <div v-if="!nodeStatus" class="sp-inline-note">加载中...</div>
-        <div v-else class="sp-node-list">
-          <div v-for="n in nodeStatus.nodes" :key="n.url" :class="['sp-node-row', { 'sp-node-row--selected': n.selected }]">
-            <div class="sp-node-info">
-              <span :class="['sp-node-indicator', 'sp-node-indicator--' + n.status]" :title="n.status"></span>
-              <div class="sp-node-meta">
-                <span class="sp-node-url" :title="n.url">{{ n.url }}</span>
-                <span class="sp-node-sub">
-                  <span :class="['sp-node-latency', { 'sp-node-latency--bad': n.latencyMs > 500 }]">
-                    {{ n.latencyMs >= 0 ? n.latencyMs + 'ms' : '—' }}
-                  </span>
-                  <span class="sp-node-subsep">·</span>
-                  <span>{{ n.status === 'healthy' ? '健康' : n.status === 'unhealthy' ? '不可达' : n.status === 'checking' ? '检测中' : '未检测' }}</span>
-                  <span v-if="n.lastError" class="sp-node-subsep">·</span>
-                  <span v-if="n.lastError" class="sp-node-error" :title="n.lastError">{{ n.lastError }}</span>
-                </span>
-              </div>
-            </div>
-            <button
-              v-if="n.selected"
-              class="sp-header-btn sp-header-btn-primary"
-              disabled
-            >当前</button>
-            <button
-              v-else-if="n.status === 'healthy'"
-              class="sp-header-btn"
-              :disabled="nodeSelecting !== ''"
-              @click="selectNode(n.url)"
-            >{{ nodeSelecting === n.url ? "切换中..." : "切换" }}</button>
-            <span v-else class="sp-header-btn" style="opacity:.5;cursor:not-allowed" :title="n.status === 'unhealthy' ? '该节点未通过健康检测' : '请先检测'">—</span>
-          </div>
-        </div>
-        <div v-if="nodeStatus?.expiresAt" class="sp-inline-note">
-          下次自动检测：{{ new Date(nodeStatus.expiresAt).toLocaleString() }}
         </div>
       </div>
     </div>

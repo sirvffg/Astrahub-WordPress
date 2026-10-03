@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 // 构建产物输出到插件的 assets/ 目录，固定文件名，便于 PHP enqueue。
 // dev 模式直接用 index.html（带 mock bootstrap）独立预览整套后台 UI。
 export default defineConfig({
+  base: "./",
   plugins: [vue()],
   build: {
     outDir: resolve(__dirname, "../assets/dist"),

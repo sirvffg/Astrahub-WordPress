@@ -1,4 +1,4 @@
-﻿<?php
+<?php
 /**
  * 友链管理 REST 路由（命名空间 wp-astrahub/v1），对齐 Halo 端
  * AstraHubFriendManagementRouter。

@@ -1,7 +1,9 @@
 <script lang="ts" setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { graphAvatarProxyUrl } from "../api/client";
+interface WorldChatSettings { credentials: { siteId: string; apiKey: string }; connection: { hubBaseUrl: string } }
 import type { HubRealtimeEvent } from "../composables/useFriendInvitationRealtime";
+import { useAstraHubSessionState } from "../composables/useAstraHubSessionState";
 import {
   createFriendInvitation
 } from "../api/friend";
@@ -36,30 +38,55 @@ import {
   type WorldChatSticker
 } from "../composables/useWorldChat";
 
-interface WorldChatSettings {
-  credentials: { siteId: string; apiKey: string };
-  connection: { hubBaseUrl: string };
-}
-
 const props = defineProps<{
   settings: WorldChatSettings;
   realtimeEvent: HubRealtimeEvent<unknown> | null;
 }>();
 
-const messages = ref<WorldChatMessage[]>([]);
-const members = ref<WorldChatMemberSummary[]>([]);
-const selectedMember = ref<WorldChatMemberDetail | null>(null);
-const recentPosts = ref<WorldChatRecentPost[]>([]);
-const stickers = ref<WorldChatSticker[]>([]);
-const consentState = ref<WorldChatConsentState | null>(null);
+let disposed = false;
+const bufferedRealtime: HubRealtimeEvent<unknown>[] = [];
+
+const chatSession = useAstraHubSessionState("world-chat", props.settings.credentials.siteId, () => ({
+  messages: ref<WorldChatMessage[]>([]),
+  currentMember: ref<WorldChatMemberDetail | null>(null),
+  deliveryStates: ref<Record<string, OptimisticDelivery>>({}),
+  members: ref<WorldChatMemberSummary[]>([]),
+  selectedMember: ref<WorldChatMemberDetail | null>(null),
+  recentPosts: ref<WorldChatRecentPost[]>([]),
+  stickers: ref<WorldChatSticker[]>([]),
+  consentState: ref<WorldChatConsentState | null>(null),
+  visibleRecentPostCount: ref(4),
+  inputText: ref(""),
+  searchQuery: ref(""),
+  memberDrawerCollapsed: ref(false),
+  hasMoreBefore: ref(false),
+  memberTotal: ref(0),
+  maxMessageBytes: ref(4096),
+  pendingNewMessages: ref(0),
+  pendingMentionCount: ref(0),
+  latestMentionMessageId: ref(""),
+  historyAnchorMessageId: ref(""),
+  historyUnreadCount: ref(0),
+  historyPromptVisible: ref(false),
+  historyAnchorLocated: ref(false),
+  replyDraftMessage: ref<WorldChatMessage | null>(null),
+  mutedUntil: ref(""),
+  mutedReason: ref(""),
+  initialized: ref(false),
+  scrollOffsetFromBottom: ref(0)
+}));
+const {
+  messages, currentMember, deliveryStates, members, selectedMember, recentPosts, stickers, consentState,
+  visibleRecentPostCount, inputText, searchQuery, memberDrawerCollapsed,
+  hasMoreBefore, memberTotal, maxMessageBytes, pendingNewMessages,
+  pendingMentionCount, latestMentionMessageId, historyAnchorMessageId,
+  historyUnreadCount, historyPromptVisible, historyAnchorLocated,
+  replyDraftMessage, mutedUntil, mutedReason, initialized, scrollOffsetFromBottom
+} = chatSession;
 const consentLoading = ref(false);
 const consentSubmitting = ref(false);
 const consentScrolledToEnd = ref(false);
-const visibleRecentPostCount = ref(4);
-const inputText = ref("");
-const searchQuery = ref("");
 const searchExpanded = ref(false);
-const memberDrawerCollapsed = ref(false);
 const emojiPickerOpen = ref(false);
 const mentionPickerOpen = ref(false);
 const activeEmojiGroup = ref("常用");
@@ -68,28 +95,17 @@ const stickerEditing = ref(false);
 const loading = ref(false);
 const loadingMembers = ref(false);
 const loadingMore = ref(false);
-const sending = ref(false);
 const loadingMentions = ref(false);
 const uploadingSticker = ref(false);
 const inviting = ref(false);
 const reportingMessageId = ref("");
 const retractingMessageId = ref("");
-const hasMoreBefore = ref(false);
-const memberTotal = ref(0);
-const maxMessageBytes = ref(4096);
-const pendingNewMessages = ref(0);
-const pendingMentionCount = ref(0);
-const latestMentionMessageId = ref("");
-const historyAnchorMessageId = ref("");
-const historyUnreadCount = ref(0);
-const historyPromptVisible = ref(false);
-const historyAnchorLocated = ref(false);
 const loadingHistoryAnchor = ref(false);
+const loadingMemberDetail = ref(false);
 const highlightedMessageId = ref("");
-const replyDraftMessage = ref<WorldChatMessage | null>(null);
+const secondaryMediaReady = ref(false);
+let deferredMediaTimer: number | undefined;
 const currentTime = ref(Date.now());
-const mutedUntil = ref("");
-const mutedReason = ref("");
 const mentionCandidates = ref<WorldChatMentionCandidate[]>([]);
 const mentionCandidateTotal = ref(0);
 const mentionCandidateQuery = ref("");
@@ -108,6 +124,13 @@ const emojiPanelStyle = ref<Record<string, string>>({
 });
 
 type DisplayableWorldChatMessage = WorldChatMessage | WorldChatReplySummary;
+type DeliveryState = "sending" | "failed";
+type OptimisticDelivery = {
+  state: DeliveryState;
+  encrypted: WorldChatEncryptedPayload;
+  mentions: WorldChatMentionTarget[];
+  replyToMessageId: string;
+};
 
 const canAccess = computed(() => hasWorldChatAccess(props.settings.credentials.siteId, Boolean(props.settings.credentials.apiKey)));
 const consentAccepted = computed(() => Boolean(consentState.value?.accepted));
@@ -115,6 +138,19 @@ const consentPolicyTitle = computed(() => consentState.value?.title || "星际�
 const consentPolicyMarkdown = computed(() => consentState.value?.contentMarkdown || "");
 const consentPolicyHtml = computed(() => renderConsentMarkdown(consentPolicyMarkdown.value));
 const currentSiteId = computed(() => String(props.settings.credentials.siteId || "").trim());
+const checkinLevels = [
+  { days: 730, title: "永恒远航者" },
+  { days: 360, title: "银河守望者" },
+  { days: 180, title: "星域领航员" },
+  { days: 90, title: "深空航行者" },
+  { days: 30, title: "星海巡航者" },
+  { days: 7, title: "星链观测者" }
+] as const;
+type CheckinLevel = (typeof checkinLevels)[number];
+const checkinLevelCache = new Map<number, CheckinLevel | null>();
+const checkinFrames = import.meta.glob<string>("../assets/world-chat-checkin/*.webp", {
+  eager: true, query: "?url", import: "default"
+});
 const isSelectedAssistant = computed(() => isAssistantMember(selectedMember.value));
 const muteEndTime = computed(() => {
   const value = mutedUntil.value.trim();
@@ -154,9 +190,6 @@ const memberBySiteId = computed(() => {
       index.set(member.siteId, member);
     }
   }
-  if (selectedMember.value?.siteId) {
-    index.set(selectedMember.value.siteId, selectedMember.value);
-  }
   return index;
 });
 
@@ -173,6 +206,7 @@ const emojiGroups = [
 ];
 const activeEmojiItems = computed(() => emojiGroups.find((group) => group.name === activeEmojiGroup.value)?.items || emojiGroups[0].items);
 let currentTimeTimer: number | undefined;
+let memberDetailRequestSequence = 0;
 
 function showToast(message: string, type: "success" | "error" | "info" = "info") {
   toast.value = { message, type };
@@ -245,18 +279,23 @@ function renderConsentMarkdown(markdown: string) {
 }
 
 function upsertMessages(nextMessages: WorldChatMessage[]) {
-  const byId = new Map<string, WorldChatMessage>();
-  for (const message of messages.value) {
-    if (message.messageId && message.status !== "deleted") {
-      byId.set(message.messageId, message);
-    }
-  }
+  const merged = messages.value.filter((message) => message.messageId && message.status !== "deleted");
   for (const message of nextMessages) {
-    if (message.messageId && message.status !== "deleted") {
-      byId.set(message.messageId, message);
+    if (!message.messageId || message.status === "deleted") {
+      continue;
+    }
+    const index = merged.findIndex((item) => item.messageId === message.messageId
+      || (message.clientMessageId && item.clientMessageId === message.clientMessageId));
+    if (index >= 0) {
+      merged[index] = message;
+    } else {
+      merged.push(message);
+    }
+    if (message.clientMessageId && !message.messageId.startsWith("local:")) {
+      delete deliveryStates.value[message.clientMessageId];
     }
   }
-  messages.value = Array.from(byId.values()).sort((a, b) => {
+  messages.value = merged.sort((a, b) => {
     return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
   });
 }
@@ -271,6 +310,8 @@ function applyMessageUpdate(message: WorldChatMessage) {
 
 function clearWorldChatData() {
   messages.value = [];
+  currentMember.value = null;
+  deliveryStates.value = {};
   members.value = [];
   selectedMember.value = null;
   recentPosts.value = [];
@@ -303,6 +344,7 @@ async function loadConsentGate() {
   try {
     const state = await fetchWorldChatConsent();
     consentState.value = state;
+    initialized.value = true;
     if (state.accepted) {
       await loadBootstrap();
       return;
@@ -331,7 +373,7 @@ async function submitConsent(accepted: boolean) {
       return;
     }
     clearWorldChatData();
-    showToast("已暂停星际通讯服务", "info");
+    showToast("已暂停星际通讯连接", "info");
   } catch (error) {
     showToast(error instanceof Error ? error.message : "通讯协议确认失败", "error");
   } finally {
@@ -348,6 +390,7 @@ function handleConsentScroll(event: Event) {
 }
 
 async function loadBootstrap() {
+  if (disposed || loading.value) return;
   if (!canAccess.value || !consentAccepted.value) {
     messages.value = [];
     members.value = [];
@@ -356,6 +399,7 @@ async function loadBootstrap() {
   loading.value = true;
   try {
     const bootstrap = await fetchWorldChatBootstrap();
+    if (disposed) return;
     const unreadSnapshot = bootstrap.unread || null;
     const unreadCount = Number(unreadSnapshot?.unreadCount || 0);
     const lastReadMessageId = String(unreadSnapshot?.lastReadMessageId || "").trim();
@@ -365,7 +409,17 @@ async function loadBootstrap() {
     historyAnchorLocated.value = false;
     pendingMentionCount.value = Number(unreadSnapshot?.mentionCount || 0);
     latestMentionMessageId.value = String(unreadSnapshot?.latestMentionMessageId || "");
-    messages.value = Array.isArray(bootstrap.latest) ? bootstrap.latest.filter((message) => message.status !== "deleted") : [];
+    const remoteMessages = Array.isArray(bootstrap.latest) ? bootstrap.latest.filter((message) => message.status !== "deleted") : [];
+    const remoteClientIds = new Set(remoteMessages.map((message) => message.clientMessageId).filter(Boolean));
+    const localMessages = messages.value.filter((message) => message.messageId.startsWith("local:")
+      && deliveryState(message)
+      && !remoteClientIds.has(message.clientMessageId));
+    messages.value = remoteMessages;
+    for (const clientMessageId of remoteClientIds) {
+      delete deliveryStates.value[clientMessageId];
+    }
+    upsertMessages(localMessages);
+    currentMember.value = bootstrap.member || null;
     maxMessageBytes.value = Number(bootstrap.limits?.maxMessageBytes || 4096);
     hasMoreBefore.value = messages.value.length >= Number(bootstrap.limits?.messagePageSize || 30);
     mutedUntil.value = String(bootstrap.muted?.mutedUntil || "");
@@ -374,14 +428,29 @@ async function loadBootstrap() {
     memberTotal.value = Number(bootstrap.members?.total || 0);
     members.value = [];
     upsertMembers(Array.isArray(bootstrap.members?.items) ? bootstrap.members.items : []);
+    loading.value = false;
     await nextTick();
     scrollToBottom();
-    await markWorldChatRead().catch(() => undefined);
+    scheduleDeferredMedia();
+    void markWorldChatRead().catch(() => undefined);
   } catch (error) {
     showToast(error instanceof Error ? error.message : "星际通讯加载失败", "error");
   } finally {
     loading.value = false;
+    if (!disposed) {
+      for (const event of bufferedRealtime.splice(0)) void handleChatRealtime(event);
+    }
   }
+}
+
+function scheduleDeferredMedia() {
+  if (secondaryMediaReady.value || deferredMediaTimer !== undefined) {
+    return;
+  }
+  deferredMediaTimer = window.setTimeout(() => {
+    deferredMediaTimer = undefined;
+    secondaryMediaReady.value = true;
+  }, 0);
 }
 
 async function loadStickers() {
@@ -393,7 +462,7 @@ async function loadStickers() {
     const response = await fetchWorldChatStickers();
     stickers.value = Array.isArray(response.items) ? response.items : [];
   } catch (error) {
-    showToast(error instanceof Error ? error.message : "表情包加载失败", "error");
+    showToast(error instanceof Error ? error.message : "未读状态加载失败", "error");
   }
 }
 
@@ -418,18 +487,19 @@ async function loadMembers(reset = false) {
 }
 
 function upsertMembers(nextMembers: WorldChatMemberSummary[]) {
-  const seen = new Set<string>();
-  const ordered: WorldChatMemberSummary[] = [];
-  for (const member of members.value) {
-    if (member.siteId) {
-      seen.add(member.siteId);
-      ordered.push(member);
-    }
-  }
+  const ordered = [...members.value];
+  const indexBySiteId = new Map<string, number>();
+  ordered.forEach((member, index) => {
+    if (member.siteId) indexBySiteId.set(member.siteId, index);
+  });
   for (const member of nextMembers) {
-    if (member.siteId && !seen.has(member.siteId)) {
-      seen.add(member.siteId);
+    if (!member.siteId) continue;
+    const index = indexBySiteId.get(member.siteId);
+    if (index === undefined) {
+      indexBySiteId.set(member.siteId, ordered.length);
       ordered.push(member);
+    } else {
+      ordered[index] = { ...ordered[index], ...member };
     }
   }
   members.value = ordered;
@@ -462,9 +532,80 @@ async function loadEarlierMessages() {
   }
 }
 
+function optimisticSender(): WorldChatMemberSummary {
+  return currentMember.value || memberBySiteId.value.get(currentSiteId.value) || {
+    siteId: currentSiteId.value,
+    name: "本站",
+    url: ""
+  };
+}
+
+function deliveryState(message: WorldChatMessage): DeliveryState | "" {
+  return deliveryStates.value[message.clientMessageId]?.state || "";
+}
+
+function createOptimisticMessage(
+  encrypted: WorldChatEncryptedPayload,
+  clientMessageId: string,
+  mentions: WorldChatMentionTarget[],
+  replyMessage: WorldChatMessage | null
+): WorldChatMessage {
+  const now = new Date().toISOString();
+  return {
+    messageId: `local:${clientMessageId}`,
+    clientMessageId,
+    sender: optimisticSender(),
+    encrypted,
+    replyToMessageId: replyMessage?.messageId || "",
+    replyTo: replyMessage ? {
+      messageId: replyMessage.messageId,
+      sender: replyMessage.sender,
+      encrypted: replyMessage.encrypted,
+      status: replyMessage.status,
+      createdAt: replyMessage.createdAt,
+      deletedAt: replyMessage.deletedAt
+    } : undefined,
+    mentions,
+    status: "normal",
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+async function deliverOptimisticMessage(message: WorldChatMessage) {
+  const delivery = deliveryStates.value[message.clientMessageId];
+  if (!delivery || delivery.state === "sending") {
+    return;
+  }
+  delivery.state = "sending";
+  try {
+    const response = await sendWorldChatMessage(
+      delivery.encrypted,
+      message.clientMessageId,
+      delivery.mentions,
+      delivery.replyToMessageId
+    );
+    upsertMessages([response.message]);
+  } catch (error) {
+    const current = deliveryStates.value[message.clientMessageId];
+    if (current) {
+      current.state = "failed";
+    }
+    const failure = error instanceof Error ? error.message : "消息发送失败";
+    showToast(failure.includes("rate limit") || failure.includes("429") ? "发送太快了，请稍后再试。" : failure, "error");
+  }
+}
+
+async function retryMessage(message: WorldChatMessage) {
+  if (deliveryState(message) !== "failed") {
+    return;
+  }
+  await deliverOptimisticMessage(message);
+}
+
 async function sendMessage() {
   if (!consentAccepted.value) {
-    showToast("请先同意星际通讯服务协议", "error");
+    showToast("请先同意星际通讯使用协议", "error");
     return;
   }
   const text = inputText.value.trim();
@@ -472,64 +613,67 @@ async function sendMessage() {
     showToast(muteText.value, "error");
     return;
   }
-  if (!text || sending.value) {
+  if (!text) {
     return;
   }
   const encrypted = buildPlainTransportFrame(text);
   if (encrypted.ciphertext.length > maxMessageBytes.value) {
-    showToast(`单条消息不能超过 ${maxMessageBytes.value} 字节`, "error");
+    showToast(`消息内容不能超过 ${maxMessageBytes.value} 字节`, "error");
     return;
   }
-  sending.value = true;
-  try {
-    const clientMessageId = `wc_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    const response = await sendWorldChatMessage(encrypted, clientMessageId, activeMentionTargets(text), replyDraftMessage.value?.messageId || "");
-    upsertMessages([response.message]);
-    inputText.value = "";
-    draftMentions.value = [];
-    replyDraftMessage.value = null;
-    mentionPickerOpen.value = false;
-    scrollToBottom();
-    await focusMessageInput();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "消息发送失败";
-    showToast(message.includes("rate limit") || message.includes("429") ? "发送太快了，请稍后再试。" : message, "error");
-  } finally {
-    sending.value = false;
-  }
+  const clientMessageId = `wc_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const mentions = activeMentionTargets(text);
+  const replyMessage = replyDraftMessage.value;
+  const optimistic = createOptimisticMessage(encrypted, clientMessageId, mentions, replyMessage);
+  deliveryStates.value[clientMessageId] = {
+    state: "failed",
+    encrypted,
+    mentions,
+    replyToMessageId: replyMessage?.messageId || ""
+  };
+  upsertMessages([optimistic]);
+  inputText.value = "";
+  draftMentions.value = [];
+  replyDraftMessage.value = null;
+  mentionPickerOpen.value = false;
+  await nextTick();
+  scrollToBottom();
+  await focusMessageInput();
+  void deliverOptimisticMessage(optimistic);
 }
 
 async function sendSticker(sticker: WorldChatSticker) {
   if (!consentAccepted.value) {
-    showToast("请先同意星际通讯服务协议", "error");
+    showToast("请先同意星际通讯使用协议", "error");
     return;
   }
   if (isMuted.value) {
     showToast(muteText.value, "error");
     return;
   }
-  if (!sticker.stickerId || sending.value) {
+  if (!sticker.stickerId) {
     return;
   }
   const encrypted = buildPlainTransportFrame(stickerPayloadText(sticker.stickerId));
-  sending.value = true;
-  try {
-    const clientMessageId = `wc_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    const response = await sendWorldChatMessage(encrypted, clientMessageId);
-    upsertMessages([response.message]);
-    emojiPickerOpen.value = false;
-    scrollToBottom();
-    await focusMessageInput();
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : "表情包发送失败", "error");
-  } finally {
-    sending.value = false;
-  }
+  const clientMessageId = `wc_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const optimistic = createOptimisticMessage(encrypted, clientMessageId, [], null);
+  deliveryStates.value[clientMessageId] = {
+    state: "failed",
+    encrypted,
+    mentions: [],
+    replyToMessageId: ""
+  };
+  upsertMessages([optimistic]);
+  emojiPickerOpen.value = false;
+  await nextTick();
+  scrollToBottom();
+  await focusMessageInput();
+  void deliverOptimisticMessage(optimistic);
 }
 
 function openStickerUpload() {
   if (stickers.value.length >= 10) {
-    showToast("每个星系最多上传 10 个表情包", "error");
+    showToast("每个站点最多上传 10 张表情", "error");
     return;
   }
   stickerInputRef.value?.click();
@@ -542,7 +686,7 @@ async function handleStickerUpload(event: Event) {
     return;
   }
   if (!consentAccepted.value) {
-    showToast("请先同意星际通讯服务协议", "error");
+    showToast("请先同意星际通讯使用协议", "error");
     return;
   }
   input.value = "";
@@ -551,7 +695,7 @@ async function handleStickerUpload(event: Event) {
     return;
   }
   if (!["image/png", "image/jpeg", "image/gif"].includes(file.type)) {
-    showToast("仅支持 PNG、JPG、GIF 表情包", "error");
+    showToast("仅支持 PNG、JPG、GIF 格式", "error");
     return;
   }
   uploadingSticker.value = true;
@@ -605,32 +749,74 @@ async function openMember(siteId: string) {
     return;
   }
   if (siteId === "system_xiaoxing") {
-    selectedMember.value = assistantMemberDetail();
+    memberDetailRequestSequence += 1;
+    loadingMemberDetail.value = false;
+    selectedMember.value = assistantMemberDetail(assistantMemberSummary());
     visibleRecentPostCount.value = 4;
     recentPosts.value = [];
     return;
   }
+  const requestSequence = ++memberDetailRequestSequence;
+  const summary = memberBySiteId.value.get(siteId);
+  selectedMember.value = summary
+    ? { ...summary }
+    : { siteId, name: "正在加载成员资料", url: "" };
+  visibleRecentPostCount.value = 4;
+  recentPosts.value = [];
+  loadingMemberDetail.value = true;
   try {
-    selectedMember.value = await fetchWorldChatMember(siteId);
-    visibleRecentPostCount.value = 4;
-    const posts = await fetchWorldChatMemberRecentPosts(siteId, 20);
+    const [member, posts] = await Promise.all([
+      fetchWorldChatMember(siteId),
+      fetchWorldChatMemberRecentPosts(siteId, 20)
+    ]);
+    if (requestSequence !== memberDetailRequestSequence || selectedMember.value?.siteId !== siteId) {
+      return;
+    }
+    selectedMember.value = member;
     recentPosts.value = Array.isArray(posts.items) ? posts.items : [];
   } catch (error) {
-    showToast(error instanceof Error ? error.message : "成员资料加载失败", "error");
+    if (requestSequence === memberDetailRequestSequence) {
+      showToast(error instanceof Error ? error.message : "成员资料加载失败", "error");
+    }
+  } finally {
+    if (requestSequence === memberDetailRequestSequence) {
+      loadingMemberDetail.value = false;
+    }
   }
 }
 
-function assistantMemberDetail(): WorldChatMemberDetail {
+function closeMember() {
+  memberDetailRequestSequence += 1;
+  loadingMemberDetail.value = false;
+  selectedMember.value = null;
+  recentPosts.value = [];
+}
+
+function assistantMemberSummary(): WorldChatMemberSummary | null {
+  const listedMember = memberBySiteId.value.get("system_xiaoxing");
+  if (listedMember) {
+    return listedMember;
+  }
+  for (let index = messages.value.length - 1; index >= 0; index -= 1) {
+    const sender = messages.value[index]?.sender;
+    if (isAssistantMember(sender)) {
+      return sender;
+    }
+  }
+  return null;
+}
+
+function assistantMemberDetail(source: WorldChatMemberSummary | null): WorldChatMemberDetail {
   const now = new Date().toISOString();
   return {
     siteId: "system_xiaoxing",
     name: "AstrahBot",
     url: "",
-    category: "星链助手",
-    description: "AstrahBot 是驻留在 AstraHub 世界频道里的星链向导。它不会代表任何用户站点，也不会参与友链关系；它只在公开频道中响应 @AstrahBot 的提问，帮助你理解星链生态、接入流程、RSS 同步、文章发现、星系关系与世界频道使用方式。涉及真实生态数据时，它会通过 Hub 的当前数据进行核验后再回答。",
-    avatarUrl: "/xiaoxing.webp",
-    joinedAt: now,
-    updatedAt: now,
+    category: "系统助手",
+    description: "AstrahBot 是驻留在 AstraHub 公共频道的系统向导。它不代表任何用户站点，也不会主动建立关系；只在公共频道回应 @AstrahBot 提问，帮助理解星球生态、接入流程、RSS 同步、内容发现、关系网络与频道使用方式。涉及实时状态时，会通过 Hub 当前数据给出合理回答。",
+    avatarUrl: String(source?.avatarUrl || "").trim(),
+    joinedAt: source?.joinedAt || now,
+    updatedAt: source?.updatedAt || now,
     influenceScore: 0,
     trustScore: 0,
     friendLinkCount: 0,
@@ -1054,6 +1240,9 @@ function isChatAtBottom() {
 
 function handleChatScroll() {
   const el = chatScrollRef.value;
+  if (el) {
+    scrollOffsetFromBottom.value = Math.max(0, el.scrollHeight - el.scrollTop - el.clientHeight);
+  }
   if (el && el.scrollTop <= 24 && hasMoreBefore.value && !loadingMore.value) {
     void loadEarlierMessages();
   }
@@ -1107,6 +1296,9 @@ function canReportMessage(message: WorldChatMessage) {
 }
 
 function canRetractMessage(message: WorldChatMessage) {
+  if (message.messageId.startsWith("local:")) {
+    return false;
+  }
   const createdAt = new Date(message.createdAt).getTime();
   return Number.isFinite(createdAt) && currentTime.value - createdAt <= 3 * 60 * 1000;
 }
@@ -1120,22 +1312,38 @@ function avatarText(member?: WorldChatMemberSummary | null) {
   return name.slice(0, 1).toUpperCase();
 }
 
-function avatarUrl(member?: { avatarUrl?: string } | null) {
+function avatarUrl(member?: { avatarUrl?: string; updatedAt?: string } | null) {
   const raw = String(member?.avatarUrl || "").trim();
-  if (!raw) {
-    return "";
+  if (!/^https?:\/\//i.test(raw)) return "";
+  // 版本放在代理 URL 上，避免改写远端带签名的图片地址。
+  const url = graphAvatarProxyUrl(raw);
+  const version = String(member?.updatedAt || "").trim();
+  return version ? url + "&v=" + encodeURIComponent(version) : url;
+}
+
+function checkinLevel(member?: WorldChatMemberSummary | null) {
+  const days = Math.max(0, Math.floor(Number(member?.checkinDays || 0)));
+  if (checkinLevelCache.has(days)) {
+    return checkinLevelCache.get(days) || null;
   }
-  if (raw.startsWith("data:") || raw.startsWith("blob:")) {
-    return raw;
-  }
-  if (/^https?:\/\//i.test(raw)) {
-    return graphAvatarProxyUrl(raw);
-  }
-  if (raw.startsWith("/")) {
-    const hubBaseUrl = String(props.settings.connection.hubBaseUrl || "").trim().replace(/\/+$/, "");
-    return hubBaseUrl ? graphAvatarProxyUrl(`${hubBaseUrl}${raw}`) : raw;
-  }
-  return raw;
+  const level = checkinLevels.find((candidate) => days >= candidate.days) || null;
+  checkinLevelCache.set(days, level);
+  return level;
+}
+
+function checkinFrameClass(member?: WorldChatMemberSummary | null) {
+  return checkinLevel(member) ? ["has-checkin-frame"] : [];
+}
+
+function checkinFrameUrl(member?: WorldChatMemberSummary | null) {
+  const level = checkinLevel(member);
+  return level
+    ? checkinFrames[`../assets/world-chat-checkin/checkin-${level.days}-days.webp`] || ""
+    : "";
+}
+
+function checkinTitle(member?: WorldChatMemberSummary | null) {
+  return checkinLevel(member)?.title || "";
 }
 
 function displayMemberName(member?: WorldChatMemberSummary | null) {
@@ -1153,7 +1361,7 @@ function isAssistantMember(member?: WorldChatMemberSummary | null) {
 
 function mentionCandidateSubtitle(candidate: WorldChatMentionCandidate) {
   if (candidate.kind === "sitebot") {
-    return candidate.description || "星链助手";
+    return candidate.description || "系统助手";
   }
   const siteName = String(candidate.name || candidate.url || "未命名站点").trim();
   const galaxyName = String(candidate.category || "").trim();
@@ -1218,9 +1426,9 @@ function hasMemberMetrics(member?: WorldChatMemberDetail | null) {
 
 function relationActionText(member?: WorldChatMemberDetail | null) {
   if (inviting.value) {
-    return "发送中...";
+    return "邀请中...";
   }
-  return member?.relationStatus === "mutual" ? "互相关注" : "邀请友链";
+  return member?.relationStatus === "mutual" ? "互相关注" : "发送邀请";
 }
 
 function relationActionDisabled(member?: WorldChatMemberDetail | null) {
@@ -1247,7 +1455,7 @@ function formatDateTime(value: Date) {
 
 function messageText(message: WorldChatMessage) {
   if (message.status === "deleted") {
-    return isOwnMessage(message) ? "我已撤回" : "对方已撤回";
+    return isOwnMessage(message) ? "你已撤回" : "对方已撤回";
   }
   return displayPayloadText(message);
 }
@@ -1258,7 +1466,7 @@ function displayPayloadText(message: DisplayableWorldChatMessage) {
   }
   const encrypted = message.encrypted;
   if (!encrypted || encrypted.algorithm !== "plain-text") {
-    return "[加密消息]";
+    return "[回复消息]";
   }
   return decodeBase64Text(encrypted.ciphertext);
 }
@@ -1300,7 +1508,7 @@ function quotedPreviewText(message: WorldChatMessage) {
 
 function quoteAuthorName(message?: DisplayableWorldChatMessage | null) {
   if (!message) {
-    return "引用消息";
+    return "回复消息";
   }
   return displayMemberName(message.sender);
 }
@@ -1398,7 +1606,7 @@ async function refreshLatestMessages() {
   if (!consentAccepted.value) {
     return;
   }
-  const lastMessage = messages.value[messages.value.length - 1];
+  const lastMessage = [...messages.value].reverse().find((message) => !message.messageId.startsWith("local:"));
   const response = await fetchWorldChatMessages({
     afterMessageId: lastMessage?.messageId,
     limit: 30
@@ -1406,17 +1614,76 @@ async function refreshLatestMessages() {
   upsertMessages(Array.isArray(response.items) ? response.items : []);
 }
 
-watch(
-  () => props.realtimeEvent,
-  async (event) => {
+async function handleChatRealtime(event: HubRealtimeEvent<unknown> | null) {
+    if (disposed) return;
     if (!consentAccepted.value) {
       return;
     }
     if (!event) {
       return;
     }
+    if (loading.value && event.type !== "realtime_resync_required") {
+      bufferedRealtime.push(event);
+      return;
+    }
+    if (event.type === "realtime_resync_required") {
+      await loadBootstrap();
+      return;
+    }
+    if (event.type === "site_profile_updated") {
+      const data = (event.data || {}) as {
+        siteId?: string;
+        name?: string;
+        url?: string;
+        nodeName?: string;
+        category?: string;
+        nodeAvatar?: string;
+        profileUpdatedAt?: string;
+      };
+      const siteId = String(data.siteId || "").trim();
+      const relevant = members.value.some((member) => member.siteId === siteId)
+        || messages.value.some((message) => message.sender?.siteId === siteId)
+        || selectedMember.value?.siteId === siteId;
+      if (siteId && relevant) {
+        const profile: WorldChatMemberSummary = {
+          siteId,
+          name: String(data.name || "").trim(),
+          url: String(data.url || "").trim(),
+          category: String(data.nodeName || data.category || "").trim(),
+          avatarUrl: String(data.nodeAvatar || "").trim(),
+          updatedAt: String(data.profileUpdatedAt || new Date().toISOString()).trim()
+        };
+        upsertMembers([profile]);
+        if (selectedMember.value?.siteId === siteId) {
+          selectedMember.value = { ...selectedMember.value, ...profile };
+        }
+      }
+      return;
+    }
     if (event.type === "world_chat_mute_updated") {
       applyMuteUpdateFromEvent(event);
+      return;
+    }
+    if (event.type === "world_chat_member_updated") {
+      const data = (event.data || {}) as { member?: WorldChatMemberSummary };
+      const member = data.member;
+      if (!member?.siteId) {
+        return;
+      }
+      upsertMembers([member]);
+      if (currentMember.value?.siteId === member.siteId) {
+        currentMember.value = { ...currentMember.value, ...member };
+      }
+      if (selectedMember.value?.siteId === member.siteId) {
+        selectedMember.value = { ...selectedMember.value, ...member };
+      }
+      messages.value = messages.value.map((message) => ({
+        ...message,
+        sender: message.sender?.siteId === member.siteId ? { ...message.sender, ...member } : message.sender,
+        replyTo: message.replyTo && message.replyTo.sender?.siteId === member.siteId
+          ? { ...message.replyTo, sender: { ...message.replyTo.sender, ...member } }
+          : message.replyTo
+      }));
       return;
     }
     if (event.type !== "world_chat_message_created" && event.type !== "world_chat_message_updated") {
@@ -1443,8 +1710,8 @@ watch(
     if (shouldFollow) {
       scrollToBottom();
     }
-  }
-);
+}
+watch(() => props.realtimeEvent, handleChatRealtime, { flush: "sync" });
 
 watch(
   () => [props.settings.credentials.siteId, props.settings.credentials.apiKey].join("|"),
@@ -1461,10 +1728,19 @@ onMounted(() => {
   document.addEventListener("wheel", handleDocumentScrollBlock, { passive: false });
   document.addEventListener("touchmove", handleDocumentScrollBlock, { passive: false });
   window.addEventListener("resize", updateEmojiPanelPosition);
+  // Cached chat data survives Halo route changes, while this lightweight
+  // media gate is component-local. Re-enable avatar/sticker rendering on
+  // every mount even when Bootstrap can be skipped.
+  scheduleDeferredMedia();
   void loadConsentGate();
 });
 
 onBeforeUnmount(() => {
+  disposed = true;
+  bufferedRealtime.length = 0;
+  loading.value = false;
+  loadingMembers.value = false;
+  loadingMore.value = false;
   if (currentTimeTimer !== undefined) {
     window.clearInterval(currentTimeTimer);
   }
@@ -1472,6 +1748,10 @@ onBeforeUnmount(() => {
   document.removeEventListener("wheel", handleDocumentScrollBlock);
   document.removeEventListener("touchmove", handleDocumentScrollBlock);
   window.removeEventListener("resize", updateEmojiPanelPosition);
+  if (deferredMediaTimer !== undefined) {
+    window.clearTimeout(deferredMediaTimer);
+    deferredMediaTimer = undefined;
+  }
 });
 </script>
 
@@ -1479,14 +1759,14 @@ onBeforeUnmount(() => {
   <section ref="shellRef" class="sc-shell" :class="{ 'is-drawer-collapsed': memberDrawerCollapsed }">
     <div v-if="!canAccess" class="sc-empty">
       <strong>请先完成接入或重新登舱</strong>
-      <span>星际通讯只向已接入星链的站点开放，插件会使用本地保存的站点编号和密钥签名访问 Hub。</span>
+      <span>星际通讯只向已接入星链的站点开放，消息会使用本站保存的站点编号和密钥签名发送到 Hub。</span>
     </div>
 
     <template v-else>
       <main class="sc-chat">
         <header class="sc-chat-head">
           <div>
-            <strong>世界频道</strong>
+            <strong>公共频道</strong>
           </div>
           <button class="sc-chat-refresh" type="button" :disabled="loading || consentLoading" @click="loadConsentGate">
             <span :class="{ 'is-spinning': loading || consentLoading }"></span>
@@ -1499,7 +1779,7 @@ onBeforeUnmount(() => {
             {{ loadingMore ? "加载中..." : "加载历史通讯记录" }}
           </div>
 
-          <div v-if="loading || consentLoading" class="sc-state">正在接入世界频道...</div>
+          <div v-if="loading || consentLoading" class="sc-state">正在接入公共频道...</div>
           <div v-else-if="messages.length === 0" class="sc-state">暂无通讯记录</div>
 
           <template v-for="message in messages" :key="message.messageId">
@@ -1510,29 +1790,56 @@ onBeforeUnmount(() => {
             :class="{ 'is-own': isOwnMessage(message), 'is-retracted': message.status === 'deleted', 'is-highlighted': highlightedMessageId === message.messageId }"
           >
             <p v-if="message.status === 'deleted'" class="sc-retract-notice">{{ messageText(message) }}</p>
-            <button v-else class="sc-avatar" type="button" @click="openMember(message.sender.siteId)" @contextmenu.prevent="openMentionContext($event, displayMessageMember(message))">
-              <img v-if="avatarUrl(displayMessageMember(message))" :src="avatarUrl(displayMessageMember(message))" alt="" />
-              <span v-else>{{ avatarText(displayMessageMember(message)) }}</span>
+            <button v-else class="sc-avatar" :class="checkinFrameClass(displayMessageMember(message))" type="button" @click="openMember(message.sender.siteId)" @contextmenu.prevent="openMentionContext($event, displayMessageMember(message))">
+              <img
+                v-if="secondaryMediaReady && avatarUrl(displayMessageMember(message))"
+                class="sc-avatar-image"
+                :src="avatarUrl(displayMessageMember(message))"
+                alt=""
+                loading="lazy"
+                decoding="async"
+                fetchpriority="low"
+              />
+              <span v-else class="sc-avatar-fallback">{{ avatarText(displayMessageMember(message)) }}</span>
+              <img
+                v-if="checkinFrameUrl(displayMessageMember(message))"
+                class="sc-checkin-frame"
+                :src="checkinFrameUrl(displayMessageMember(message))"
+                alt=""
+                aria-hidden="true"
+              />
             </button>
             <div v-if="message.status !== 'deleted'" class="sc-message-body">
               <div class="sc-message-meta">
                 <button type="button" @click="openMember(message.sender.siteId)" @contextmenu.prevent="openMentionContext($event, displayMessageMember(message))">{{ displayMemberName(displayMessageMember(message)) }}</button>
+                <em v-if="checkinTitle(displayMessageMember(message))" class="sc-checkin-title">{{ checkinTitle(displayMessageMember(message)) }}</em>
                 <span>{{ formatTime(message.createdAt) }}</span>
               </div>
-              <div v-if="isStickerMessage(message)" class="sc-sticker-bubble" @contextmenu.prevent="openQuoteContext($event, message)">
-                <img :src="stickerMessageUrl(message)" alt="" />
-              </div>
-              <div v-else class="sc-bubble" @contextmenu.prevent="openQuoteContext($event, message)">
-                <div v-if="quotedMessage(message)" class="sc-quote-block">
-                  <strong>{{ quotedAuthorName(message) }}</strong>
-                  <span>{{ quotedPreviewText(message) }}</span>
+              <div class="sc-message-content">
+                <span v-if="deliveryState(message) === 'sending'" class="sc-delivery-state is-sending" title="发送中" aria-label="发送中"></span>
+                <button
+                  v-else-if="deliveryState(message) === 'failed'"
+                  class="sc-delivery-state is-failed"
+                  type="button"
+                  title="发送失败，点击重试"
+                  aria-label="发送失败，点击重试"
+                  @click="retryMessage(message)"
+                >!</button>
+                <div v-if="isStickerMessage(message)" class="sc-sticker-bubble" @contextmenu.prevent="openQuoteContext($event, message)">
+                  <img :src="stickerMessageUrl(message)" alt="" />
                 </div>
-                <p>{{ replyBodyText(message) }}</p>
+                <div v-else class="sc-bubble" @contextmenu.prevent="openQuoteContext($event, message)">
+                  <div v-if="quotedMessage(message)" class="sc-quote-block">
+                    <strong>{{ quotedAuthorName(message) }}</strong>
+                    <span>{{ quotedPreviewText(message) }}</span>
+                  </div>
+                  <p>{{ replyBodyText(message) }}</p>
+                </div>
               </div>
-              <button v-if="isOwnMessage(message) && message.status !== 'deleted' && canRetractMessage(message)" class="sc-report" type="button" @click="retractMessage(message)">
+              <button v-if="isOwnMessage(message) && !deliveryState(message) && message.status !== 'deleted' && canRetractMessage(message)" class="sc-report" type="button" @click="retractMessage(message)">
                 {{ retractingMessageId === message.messageId ? "撤回中" : "撤回" }}
               </button>
-              <span v-else-if="isOwnMessage(message) && message.status !== 'deleted'" class="sc-expired-retract">已超过3分钟，不可撤回</span>
+              <span v-else-if="isOwnMessage(message) && !deliveryState(message) && message.status !== 'deleted'" class="sc-expired-retract">已超过 3 分钟，不可撤回</span>
               <button v-if="canReportMessage(message)" class="sc-report" type="button" @click="reportMessage(message)">
                 {{ reportingMessageId === message.messageId ? "提交中" : "举报" }}
               </button>
@@ -1555,7 +1862,7 @@ onBeforeUnmount(() => {
           type="button"
           @click="handleNoticeClick"
         >
-          {{ pendingMentionCount > 0 ? "有人@我，点击查看" : `${pendingNewMessages} 条新消息，回到最新` }}
+          {{ pendingMentionCount > 0 ? "有人 @ 我，点击查看" : `${pendingNewMessages} 条新消息，回到底部` }}
         </button>
 
         <form ref="composerRef" class="sc-composer" @submit.prevent="sendMessage">
@@ -1595,7 +1902,7 @@ onBeforeUnmount(() => {
             <div v-if="replyDraftMessage" class="sc-reply-draft">
               <strong>{{ quoteAuthorName(replyDraftMessage) }}</strong>
               <span>{{ quotePreviewText(replyDraftMessage) }}</span>
-              <button type="button" aria-label="取消引用" @click="cancelReplyDraft">×</button>
+              <button type="button" aria-label="取消回复" @click="cancelReplyDraft">×</button>
             </div>
             <div v-if="mentionPickerOpen" class="sc-mention-panel" @scroll.passive="handleMentionScroll">
               <button
@@ -1605,8 +1912,15 @@ onBeforeUnmount(() => {
                 @click="insertMention(candidate)"
               >
                 <span class="sc-mention-avatar">
-                  <img v-if="avatarUrl(candidate)" :src="avatarUrl(candidate)" alt="" />
-                  <span v-else>{{ candidate.kind === 'sitebot' ? '星' : String(candidate.name || '星').slice(0, 1).toUpperCase() }}</span>
+                  <img
+                    v-if="secondaryMediaReady && avatarUrl(candidate)"
+                    :src="avatarUrl(candidate)"
+                    alt=""
+                    loading="lazy"
+                    decoding="async"
+                    fetchpriority="low"
+                  />
+                  <span v-else>{{ candidate.kind === 'sitebot' ? '助' : String(candidate.name || '星').slice(0, 1).toUpperCase() }}</span>
                 </span>
                 <span>
                   <strong>{{ candidate.name }}</strong>
@@ -1619,19 +1933,19 @@ onBeforeUnmount(() => {
               ref="messageInputRef"
               v-model="inputText"
               maxlength="500"
-              :disabled="sending || isMuted || !consentAccepted"
-              :placeholder="isMuted ? muteText : '输入要发送到世界频道的消息...'"
+              :disabled="isMuted || !consentAccepted"
+              :placeholder="isMuted ? muteText : '输入要发送到公共频道的消息...'"
               @input="handleInputMention"
               @keydown.enter.exact.prevent="sendMessage"
             ></textarea>
             <footer>
               <span>Enter 发送 / Shift + Enter 换行 · {{ inputText.length }}/500</span>
-              <button class="sc-send-button" type="submit" :disabled="sending || isMuted || !consentAccepted || !inputText.trim()" @mousedown.prevent>
-                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" :class="{ 'is-sending': sending }">
+              <button class="sc-send-button" type="submit" :disabled="isMuted || !consentAccepted || !inputText.trim()" @mousedown.prevent>
+                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
                   <path d="M4.5 11.4 19.2 4.6c.7-.3 1.4.4 1.1 1.1l-6.8 14.7c-.3.7-1.3.6-1.5-.1l-1.8-6.1-5.9-1.4c-.8-.2-.9-1.1-.2-1.4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
                   <path d="m10.4 14 4.1-4.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
                 </svg>
-                <span>{{ sending ? "发送中..." : "发送信息" }}</span>
+                <span>发送消息</span>
               </button>
             </footer>
           </div>
@@ -1646,7 +1960,7 @@ onBeforeUnmount(() => {
       <aside v-if="!memberDrawerCollapsed" class="sc-drawer">
         <div class="sc-drawer-head" :class="{ 'is-searching': searchExpanded }">
           <strong>
-            星链成员
+            在线成员
             <em v-if="pendingNewMessages > 0" class="sc-head-badge">{{ pendingNewMessages > 99 ? "99+" : pendingNewMessages }}</em>
           </strong>
           <button v-if="!searchExpanded" class="sc-search-toggle" type="button" @click="searchExpanded = true">搜索</button>
@@ -1664,21 +1978,34 @@ onBeforeUnmount(() => {
             @click="openMember(member.siteId)"
             @contextmenu.prevent="openMentionContext($event, member)"
           >
-            <span class="sc-member-avatar">
-              <img v-if="avatarUrl(member)" :src="avatarUrl(member)" alt="" />
-              <span v-else>{{ avatarText(member) }}</span>
+            <span class="sc-member-avatar" :class="checkinFrameClass(member)">
+              <img
+                v-if="secondaryMediaReady && avatarUrl(member)"
+                class="sc-avatar-image"
+                :src="avatarUrl(member)"
+                alt=""
+                loading="lazy"
+                decoding="async"
+                fetchpriority="low"
+              />
+              <span v-else class="sc-avatar-fallback">{{ avatarText(member) }}</span>
+              <img v-if="checkinFrameUrl(member)" class="sc-checkin-frame" :src="checkinFrameUrl(member)" alt="" aria-hidden="true" />
             </span>
             <span>
               <strong>{{ displayMemberName(member) }}</strong>
-              <em>加入 {{ formatDate(member.joinedAt) }} · 活跃 {{ formatDate(member.updatedAt) }}</em>
+              <em>接入 {{ formatDate(member.joinedAt) }} · 活跃 {{ formatDate(member.updatedAt) }}</em>
             </span>
           </button>
+          <div v-if="loadingMembers || members.length < memberTotal" class="sc-member-more">
+            <span v-if="loadingMembers" class="sc-member-more-spinner" aria-hidden="true"></span>
+            <strong>{{ loadingMembers ? "加载更多成员中…" : "上滑继续加载更多成员" }}</strong>
+          </div>
         </div>
       </aside>
 
       <div v-if="loading || consentLoading" class="sc-chat-loading">
         <span></span>
-        <strong>正在刷新通讯频道</strong>
+        <strong>请刷新通讯频道</strong>
       </div>
 
       <div v-if="!consentAccepted && !consentLoading" class="sc-consent-gate">
@@ -1689,9 +2016,9 @@ onBeforeUnmount(() => {
           </header>
           <div class="sc-consent-body" @scroll.passive="handleConsentScroll" v-html="consentPolicyHtml"></div>
           <footer>
-            <span class="sc-consent-status is-readable">{{ consentScrolledToEnd ? "已阅读至底部，可以确认开启星际通讯。" : "请阅读至底部后再点击同意。" }}</span>
-            <span class="sc-consent-status">{{ consentScrolledToEnd ? "已阅读至底部，可以确认开启星际通讯。" : "请阅读至底部后再点击同意。" }}</span>
-            <span>{{ consentScrolledToEnd ? "已阅读至底部，可以确认选择。" : "请阅读至底部后再点击同意。" }}</span>
+            <span class="sc-consent-status is-readable">{{ consentScrolledToEnd ? "已阅读到底部，可以确认开启星际通讯。" : "请阅读到底部，再点击同意。" }}</span>
+            <span class="sc-consent-status">{{ consentScrolledToEnd ? "已阅读到底部，可以确认开启星际通讯。" : "请阅读到底部，再点击同意。" }}</span>
+            <span>{{ consentScrolledToEnd ? "已阅读到底部，请确认选择" : "请阅读到底部，再点击同意。" }}</span>
             <div>
               <button v-if="false" type="button" class="is-secondary" :disabled="consentSubmitting || !consentState" @click="submitConsent(false)">
                 我不同意
@@ -1720,41 +2047,55 @@ onBeforeUnmount(() => {
       class="sc-quote-context"
       :style="{ left: `${quoteContextMenu.x}px`, top: `${quoteContextMenu.y}px` }"
     >
-      <button type="button" @click="quoteMessage(quoteContextMenu.message)">引用</button>
+      <button type="button" @click="quoteMessage(quoteContextMenu.message)">回复</button>
     </div>
 
     <div v-if="selectedMember" class="sc-modal-root">
       <article class="sc-modal-card">
-        <button class="sc-modal-close" type="button" @click="selectedMember = null">x</button>
-        <div class="sc-modal-layout">
+        <button class="sc-modal-close" type="button" @click="closeMember">x</button>
+        <div v-if="loadingMemberDetail" class="sc-modal-loading" aria-live="polite">
+          <span aria-hidden="true"></span>
+          <strong>loading</strong>
+        </div>
+        <div v-else class="sc-modal-layout">
           <section class="sc-profile-main">
             <header class="sc-profile-head">
-              <span class="sc-profile-avatar">
-                <img v-if="avatarUrl(selectedMember)" :src="avatarUrl(selectedMember)" alt="" />
-                <span v-else>{{ avatarText(selectedMember) }}</span>
+              <span class="sc-profile-avatar" :class="checkinFrameClass(selectedMember)">
+                <img
+                  v-if="secondaryMediaReady && avatarUrl(selectedMember)"
+                  class="sc-avatar-image"
+                  :src="avatarUrl(selectedMember)"
+                  alt=""
+                  loading="lazy"
+                  decoding="async"
+                  fetchpriority="low"
+                />
+                <span v-else class="sc-avatar-fallback">{{ avatarText(selectedMember) }}</span>
+                <img v-if="checkinFrameUrl(selectedMember)" class="sc-checkin-frame" :src="checkinFrameUrl(selectedMember)" alt="" aria-hidden="true" />
               </span>
               <div>
                 <h3>{{ selectedMember.name || "未命名站点" }}</h3>
+                <small v-if="checkinTitle(selectedMember)" class="sc-checkin-title">{{ checkinTitle(selectedMember) }}</small>
                 <span>ID：{{ selectedMember.siteId }}</span>
               </div>
             </header>
             <dl class="sc-profile-facts">
               <div>
-                <dt>星体</dt>
+                <dt>星系</dt>
                 <dd>{{ selectedMember.category || "--" }}</dd>
               </div>
               <div>
-                <dt>网址</dt>
+                <dt>地址</dt>
                 <dd>
                   <span>{{ domainText(selectedMember.url) }}</span>
                 </dd>
               </div>
               <div>
-                <dt>描述</dt>
-                <dd>{{ selectedMember.description || "这个星系暂未填写介绍。" }}</dd>
+                <dt>简介</dt>
+                <dd>{{ selectedMember.description || "该星系尚未填写介绍。" }}</dd>
               </div>
               <div>
-                <dt>加入</dt>
+                <dt>接入</dt>
                 <dd>{{ formatDate(selectedMember.joinedAt) }}</dd>
               </div>
               <div>
@@ -1762,21 +2103,16 @@ onBeforeUnmount(() => {
                 <dd>{{ formatDate(selectedMember.updatedAt) }}</dd>
               </div>
               <div v-if="hasMemberMetrics(selectedMember)">
-                <dt>数据</dt>
+                <dt>指标</dt>
                 <dd>
                   影响 {{ Number(selectedMember.influenceScore || 0).toFixed(2) }} ·
-                  可信 {{ Number(selectedMember.trustScore || 0).toFixed(2) }} ·
+                  信任 {{ Number(selectedMember.trustScore || 0).toFixed(2) }} ·
                   友链 {{ Number(selectedMember.friendLinkCount || 0) }} 条
                 </dd>
               </div>
             </dl>
-            <p v-if="false" class="sc-profile-metrics">
-              影响 {{ Number(selectedMember?.influenceScore || 0).toFixed(2) }} ·
-              可信 {{ Number(selectedMember?.trustScore || 0).toFixed(2) }} ·
-              友链 {{ Number(selectedMember?.friendLinkCount || 0) }} 条
-            </p>
             <footer v-if="!isSelectedAssistant" class="sc-modal-actions">
-              <button type="button" :disabled="!selectedMember.url" @click="visitSelectedMember">访问星球</button>
+              <button type="button" :disabled="!selectedMember.url" @click="visitSelectedMember">访问星系</button>
               <button
                 type="button"
                 :disabled="relationActionDisabled(selectedMember)"
@@ -1787,18 +2123,18 @@ onBeforeUnmount(() => {
             </footer>
           </section>
           <aside v-if="isSelectedAssistant" class="sc-assistant-card">
-            <strong>助手能力</strong>
-            <span>生态导览：解释星链里的星球、星系、关系、排行和公开动态。</span>
-            <span>接入协助：说明插件接入、重新登舱、RSS 同步和常见配置问题。</span>
-            <span>数据查询：按当前 Hub 数据回答星球数量、文章收录、RSS 状态和星系关系。</span>
-            <span>频道助手：只在被 @AstrahBot 时公开回复，不参与私聊和用户友链关系。</span>
-            <span>安全边界：不会泄露用户密钥、邮箱授权码、后台配置或非公开管理数据。</span>
+            <strong>能力说明</strong>
+            <span>生态说明：介绍博客星球、星系关系、关系排行和公开动态。</span>
+            <span>接入协议：说明签发码、重新登舱、RSS 同步和常见接入问题。</span>
+            <span>数据查询：根据当前 Hub 数据回答站点、公开记录、RSS 状态和关系网络。</span>
+            <span>频道规则：只在被 @AstrahBot 时公开回复，不参与私聊和用户友链关系。</span>
+            <span>安全边界：不会泄露密钥、后台权限码、后台用户或非公开管理数据。</span>
           </aside>
           <aside v-else class="sc-posts" @scroll.passive="handleRecentPostsScroll" @wheel.passive="handleRecentPostsWheel">
             <strong>RSS 最近文章</strong>
             <a v-for="post in visibleRecentPosts" :key="post.itemId || post.url" :href="post.url" target="_blank" rel="noreferrer">
               <span>{{ post.title }}</span>
-              <em>{{ post.summary || "暂无文章描述" }}</em>
+              <em>{{ post.summary || "暂无文章摘要" }}</em>
             </a>
             <em v-if="recentPosts.length === 0">暂无可展示文章</em>
           </aside>
@@ -1848,7 +2184,7 @@ onBeforeUnmount(() => {
 .sc-consent-card footer button{height:42px;min-width:150px;border:1px solid rgba(37,99,235,.24);border-radius:14px;background:#2563eb;color:#fff;font-size:13px;font-weight:950;cursor:pointer;box-shadow:0 12px 28px rgba(37,99,235,.16)}
 .sc-consent-card footer button.is-secondary{display:none}
 .sc-consent-card footer button:not(.is-secondary){font-size:0}
-.sc-consent-card footer button:not(.is-secondary)::before{content:"我已阅读并同意";font-size:13px}
+.sc-consent-card footer button:not(.is-secondary)::before{content:"完成阅读并同意";font-size:13px}
 .sc-consent-card footer button:disabled{cursor:not-allowed;opacity:.45}
 .sc-consent-gate{background:linear-gradient(135deg,#f8fbff 0%,#ffffff 52%,#eef6ff 100%)!important}
 .sc-consent-card{background:transparent!important;box-shadow:none!important}
@@ -1873,7 +2209,7 @@ onBeforeUnmount(() => {
 .sc-consent-card footer>.sc-consent-status.is-readable{display:inline!important;max-width:560px;color:#64748b!important;font-size:13px!important;font-weight:900!important;line-height:1.7!important}
 .sc-consent-card footer button{height:42px!important;min-width:168px!important;border:1px solid rgba(37,99,235,.22)!important;border-radius:14px!important;background:#2563eb!important;color:#fff!important;font-size:0!important;font-weight:950!important;box-shadow:0 12px 28px rgba(37,99,235,.16)!important}
 .sc-consent-card footer button.is-secondary{display:none!important}
-.sc-consent-card footer button:not(.is-secondary)::before{content:"我已阅读并同意"!important;font-size:13px!important}
+.sc-consent-card footer button:not(.is-secondary)::before{content:"完成阅读并同意"!important;font-size:13px!important}
 .sc-consent-card footer button:disabled{cursor:not-allowed!important;opacity:.45!important;box-shadow:none!important}
 .sc-consent-body :deep(.sc-consent-section){max-width:920px;margin:0 0 16px;padding:20px 24px;border:1px solid rgba(37,99,235,.08);border-radius:22px;background:rgba(255,255,255,.72);box-shadow:0 16px 38px rgba(15,23,42,.055)}
 .sc-consent-body :deep(.sc-consent-section:first-child){margin-top:4px}
@@ -1911,13 +2247,24 @@ onBeforeUnmount(() => {
 .sc-message-row.is-highlighted .sc-bubble,.sc-message-row.is-highlighted .sc-sticker-bubble{animation:scMentionFocus 2.4s ease-out;border-color:rgba(37,99,235,.38);box-shadow:0 0 0 3px rgba(37,99,235,.14),0 16px 36px rgba(37,99,235,.16)}
 .sc-retract-notice{margin:2px auto;padding:0;border:0;background:transparent;color:#94a3b8;font-size:11px;font-weight:800;line-height:1.6;text-align:center}
 .sc-avatar,.sc-member-avatar,.sc-profile-avatar{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;border-radius:999px;border:1px solid rgba(15,23,42,.08);background:#f1f5f9;color:#2563eb;font-size:13px;font-weight:900;overflow:hidden}
-.sc-avatar{width:40px!important;min-width:40px!important;max-width:40px!important;height:40px!important;min-height:40px!important;max-height:40px!important;flex:0 0 40px!important;padding:0!important;box-sizing:border-box!important;cursor:pointer}
-.sc-avatar img,.sc-member-avatar img,.sc-profile-avatar img{display:block;width:100%!important;min-width:100%!important;height:100%!important;object-fit:cover}
+.sc-avatar{width:40px;height:40px;cursor:pointer}
+.sc-avatar-image{position:relative;z-index:1;width:100%;height:100%;border-radius:999px;object-fit:cover}
+.sc-avatar-fallback{position:relative;z-index:1;display:inline-flex;align-items:center;justify-content:center;width:100%;height:100%;border-radius:999px}
+.sc-avatar.has-checkin-frame,.sc-member-avatar.has-checkin-frame,.sc-profile-avatar.has-checkin-frame{position:relative;overflow:visible;border:0;background:transparent}
+.sc-checkin-frame{position:absolute!important;top:50%;left:50%;z-index:2;display:block;width:156.25%!important;height:156.25%!important;max-width:none!important;max-height:none!important;object-fit:contain!important;transform:translate(-50%,-50%);pointer-events:none}
+.sc-avatar .sc-checkin-frame{width:175%!important;height:175%!important}
+.sc-checkin-title{display:inline-flex;align-items:center;width:max-content;padding:2px 6px;border:1px solid rgba(99,102,241,.16);border-radius:999px;background:rgba(238,242,255,.86);color:#6366f1;font-size:9px;font-style:normal;font-weight:900;line-height:1.2;white-space:nowrap}
 .sc-message-body{display:flex;flex-direction:column;align-items:flex-start;max-width:min(72%,720px)}
 .sc-message-row.is-own .sc-message-body{align-items:flex-end}
 .sc-message-meta{display:flex;align-items:center;gap:8px;margin-bottom:6px;color:#94a3b8;font-size:11px}
 .sc-message-meta button{border:0;background:transparent;color:#334155;font:inherit;font-weight:900;cursor:pointer}
 .sc-message-row.is-own .sc-message-meta button{color:#2563eb}
+.sc-message-content{display:flex;align-items:center;gap:8px;max-width:100%}
+.sc-message-row:not(.is-own) .sc-message-content{flex-direction:row-reverse}
+.sc-delivery-state{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:18px!important;min-width:18px!important;height:18px!important;padding:0!important;border-radius:999px!important;box-shadow:none!important}
+.sc-delivery-state.is-sending{box-sizing:border-box;border:2px solid rgba(100,116,139,.28);border-top-color:#64748b;animation:sc-spin .8s linear infinite}
+.sc-delivery-state.is-failed{border:0!important;background:#ef4444!important;color:#fff!important;font-size:12px!important;font-weight:950!important;line-height:1!important;cursor:pointer}
+.sc-delivery-state.is-failed:hover{background:#dc2626!important;transform:scale(1.06)}
 .sc-bubble{margin:0;padding:11px 14px;border:1px solid rgba(15,23,42,.06);border-radius:16px;border-top-left-radius:3px;background:rgba(255,255,255,.9);color:#334155;box-shadow:0 8px 24px rgba(15,23,42,.05);font-size:13px;line-height:1.75;white-space:pre-wrap;word-break:break-word}
 .sc-bubble p{margin:0}
 .sc-quote-block{display:grid;gap:2px;margin:0 0 9px;padding:0 0 0 10px;border-left:3px solid rgba(37,99,235,.48);white-space:normal}
@@ -1930,7 +2277,7 @@ onBeforeUnmount(() => {
 .sc-report{margin-top:4px;border:0;background:transparent;color:#94a3b8;font-size:10px;cursor:pointer}
 .sc-report:hover{color:#e11d48}
 .sc-expired-retract{margin-top:4px;color:#cbd5e1;font-size:10px;font-weight:800}
-.sc-composer{position:relative;flex-shrink:0;display:flex;flex-direction:column;min-height:168px;padding:0 10px 10px;border-top:0;background:rgba(255,255,255,.78);backdrop-filter:blur(18px)}
+.sc-composer{position:relative;z-index:20;flex-shrink:0;display:flex;flex-direction:column;min-height:168px;padding:0 10px 10px;border-top:0;background:rgba(255,255,255,.78);backdrop-filter:blur(18px)}
 .sc-composer-tools{display:flex;align-items:center;gap:14px;height:38px;padding:6px 20px 0}
 .sc-reply-draft{position:relative;display:grid;gap:2px;margin:10px 12px 0;padding:8px 34px 8px 12px;border:1px solid rgba(37,99,235,.12);border-radius:12px;background:rgba(239,246,255,.86);color:#475569;font-size:12px;font-weight:800}
 .sc-reply-draft strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#334155;font-size:12px;font-weight:950;line-height:1.45}
@@ -2015,12 +2362,18 @@ onBeforeUnmount(() => {
 .sc-member-card span:last-child{min-width:0;display:flex;flex-direction:column;gap:4px}
 .sc-member-card strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#1e293b;font-size:12px}
 .sc-member-card em{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#64748b;font-size:10px;font-style:normal}
+.sc-member-more{min-height:48px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;gap:8px;color:#94a3b8;flex-shrink:0}
+.sc-member-more strong{font-size:11px;font-weight:800}
+.sc-member-more-spinner{width:20px;height:20px;box-sizing:border-box;border:2px solid rgba(37,99,235,.16);border-top-color:#2563eb;border-radius:999px;animation:sc-spin .82s linear infinite}
 .sc-more-members{height:34px;border:1px dashed rgba(37,99,235,.25);border-radius:10px;background:transparent;color:#2563eb;font-size:11px;font-weight:800;cursor:pointer}
 .sc-toast{position:absolute;left:50%;bottom:170px;z-index:30;transform:translateX(-50%);padding:9px 14px;border:1px solid rgba(15,23,42,.08);border-radius:999px;background:#fff;color:#334155;box-shadow:0 18px 36px rgba(15,23,42,.14);font-size:12px;font-weight:800}
 .sc-toast.is-success{color:#059669}.sc-toast.is-error{color:#e11d48}
 .sc-modal-root{position:absolute;left:50%;top:50%;z-index:120;width:min(780px,calc(100% - 48px));height:430px;max-height:calc(100% - 48px);transform:translate(-50%,-50%);pointer-events:none}
 .sc-modal-card{position:relative;box-sizing:border-box;height:100%;overflow-y:auto;padding:22px;border:1px solid rgba(15,23,42,.08);border-radius:18px;background:rgba(255,255,255,.96);box-shadow:0 24px 70px rgba(15,23,42,.22);pointer-events:auto}
 .sc-modal-close{position:absolute;right:14px;top:14px;width:28px;height:28px;border:1px solid rgba(15,23,42,.08);border-radius:999px;background:#f8fafc;color:#64748b;cursor:pointer}
+.sc-modal-loading{display:flex;height:100%;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:#2563eb}
+.sc-modal-loading span{width:30px;height:30px;border:3px solid rgba(37,99,235,.16);border-top-color:#2563eb;border-radius:999px;animation:sc-spin .82s linear infinite}
+.sc-modal-loading strong{font-size:12px;font-weight:900}
 .sc-profile-head{display:flex;align-items:center;gap:14px;padding-right:36px}
 .sc-profile-avatar{width:56px;height:56px;font-size:20px}
 .sc-profile-head h3{margin:0 0 4px;color:#0f172a;font-size:16px;font-weight:900}
@@ -2053,5 +2406,98 @@ onBeforeUnmount(() => {
 .sc-modal-actions button:first-child{border-color:rgba(15,23,42,.08);background:#f8fafc;color:#475569}
 .sc-chat-scroll::-webkit-scrollbar,.sc-member-list::-webkit-scrollbar,.sc-modal-card::-webkit-scrollbar,.sc-posts::-webkit-scrollbar{display:none}
 .sc-chat-scroll,.sc-member-list,.sc-modal-card,.sc-posts{scrollbar-width:none}
-@media (max-width:860px){.sc-drawer{display:none}.sc-message-body{max-width:82%}.sc-modal-layout{grid-template-columns:1fr}.sc-posts{max-height:240px;overflow-y:auto}}
+@media (max-width:860px){.sc-drawer,.sc-drawer-toggle{display:none}.sc-message-body{max-width:82%}.sc-modal-layout{grid-template-columns:1fr}.sc-posts{max-height:240px;overflow-y:auto}}
+@media (max-width:640px){
+  .sc-shell{border-radius:14px;clip-path:inset(0 round 14px)}
+  .sc-chat{border-radius:14px}
+  .sc-chat-head{height:42px;padding:0 10px}
+  .sc-chat-head div{gap:1px}
+  .sc-chat-head strong{font-size:10px}
+  .sc-chat-head span{font-size:8px}
+  .sc-chat-refresh{gap:4px;height:24px;padding:0 8px;font-size:8px}
+  .sc-chat-refresh span{width:9px;height:9px;border-width:1px}
+  .sc-chat-loading{gap:7px}
+  .sc-chat-loading span{width:20px;height:20px;border-width:2px}
+  .sc-chat-loading strong{font-size:8px}
+  .sc-chat-scroll{padding:10px 8px;gap:10px}
+  .sc-load-earlier,.sc-state{padding:4px 8px;font-size:8px}
+  .sc-new-messages{bottom:108px;height:25px;padding:0 9px;font-size:8px}
+  .sc-history-messages{top:48px;height:25px;padding:0 9px;font-size:8px}
+  .sc-read-marker,.sc-retract-notice{font-size:8px}
+  .sc-message-row{gap:6px}
+  .sc-avatar{width:28px;height:28px;font-size:9px}
+  .sc-checkin-title{padding:1px 4px;font-size:7px}
+  .sc-message-body{max-width:86%}
+  .sc-message-meta{gap:4px;margin-bottom:3px;font-size:8px}
+  .sc-message-content{gap:4px}
+  .sc-delivery-state{width:13px!important;min-width:13px!important;height:13px!important}
+  .sc-delivery-state.is-sending{border-width:1px}
+  .sc-delivery-state.is-failed{font-size:8px!important}
+  .sc-bubble{padding:6px 8px;border-radius:10px;border-top-left-radius:2px;font-size:9px;line-height:1.5}
+  .sc-message-row.is-own .sc-bubble{border-top-left-radius:10px;border-top-right-radius:2px}
+  .sc-quote-block{gap:1px;margin-bottom:5px;padding-left:6px;border-left-width:2px}
+  .sc-quote-block strong,.sc-quote-block span{font-size:8px}
+  .sc-sticker-bubble{max-width:118px;max-height:118px;padding:5px;border-radius:11px;border-top-left-radius:2px}
+  .sc-message-row.is-own .sc-sticker-bubble{border-top-left-radius:11px;border-top-right-radius:2px}
+  .sc-sticker-bubble img{max-width:108px;max-height:108px;border-radius:8px}
+  .sc-report,.sc-expired-retract{margin-top:2px;font-size:7px}
+  .sc-composer{min-height:110px;padding:0 6px 6px}
+  .sc-composer-tools{height:28px;padding:3px 8px 0}
+  .sc-composer-tools .sc-emoji-button{min-width:22px!important;width:22px;height:22px!important;border-radius:6px}
+  .sc-composer-tools .sc-emoji-button svg{width:13px;height:13px}
+  .sc-input-card{min-height:76px;border-radius:11px}
+  .sc-composer textarea{min-height:46px;padding:8px 9px 4px;font-size:10px;line-height:1.5}
+  .sc-composer footer{gap:6px;padding:4px 6px 6px}
+  .sc-composer footer span{font-size:7px}
+  .sc-send-button{min-width:78px!important;width:78px;height:25px!important;padding:0 7px!important;border-radius:5px!important;font-size:8px!important;letter-spacing:.06em}
+  .sc-send-button svg{width:10px;height:10px}
+  .sc-reply-draft{gap:1px;margin:5px 6px 0;padding:5px 24px 5px 7px;border-radius:7px;font-size:8px}
+  .sc-reply-draft strong,.sc-reply-draft span{font-size:8px}
+  .sc-reply-draft button{right:5px;top:5px;width:14px!important;min-width:14px!important;height:14px!important;font-size:9px!important}
+  .sc-emoji-panel{left:8px;right:8px;bottom:calc(100% + 7px);gap:6px;padding:7px;border-radius:11px}
+  .sc-emoji-tabs{gap:3px}
+  .sc-emoji-tabs button{height:21px!important;padding:0 6px!important;font-size:8px!important}
+  .sc-emoji-scroll{grid-template-columns:repeat(auto-fill,minmax(27px,1fr));grid-auto-rows:27px;gap:4px;max-height:58px}
+  .sc-emoji-scroll button{min-width:27px!important;width:27px;height:27px;font-size:14px!important}
+  .sc-mention-panel{left:6px;right:6px;bottom:calc(100% + 5px);gap:4px;max-height:166px;padding:6px;border-radius:10px}
+  .sc-mention-panel button{gap:5px;padding:5px!important;border-radius:7px!important}
+  .sc-mention-avatar{width:22px;height:22px;font-size:8px}
+  .sc-mention-panel button>span:last-child{gap:1px}
+  .sc-mention-panel strong{font-size:8px}
+  .sc-mention-panel em{font-size:7px}
+  .sc-modal-root{width:min(248px,calc(100% - 20px));height:min(250px,calc(100% - 24px));max-height:calc(100% - 24px)}
+  .sc-modal-card{padding:8px;border-radius:9px}
+  .sc-modal-close{right:6px;top:6px;width:19px;height:19px;font-size:9px}
+  .sc-modal-layout{display:flex;height:auto;min-height:0;flex-direction:column;gap:6px}
+  .sc-profile-main{min-height:0}
+  .sc-modal-loading{gap:6px}
+  .sc-modal-loading span{width:20px;height:20px;border-width:2px}
+  .sc-modal-loading strong{font-size:8px}
+  .sc-profile-head{gap:6px;padding-right:22px}
+  .sc-profile-avatar{width:31px;height:31px;font-size:11px}
+  .sc-profile-head h3{margin-bottom:1px;font-size:9px}
+  .sc-profile-head span,.sc-profile-head a,.sc-checkin-title{font-size:7px}
+  .sc-profile-facts{gap:3px;margin-top:7px}
+  .sc-profile-facts div{grid-template-columns:31px minmax(0,1fr);gap:4px;padding:4px 5px;border-radius:6px}
+  .sc-profile-facts dt,.sc-profile-facts dd{font-size:7px;line-height:1.35}
+  .sc-modal-actions{gap:5px;padding-top:7px}
+  .sc-modal-actions button{min-width:0;height:23px;border-radius:6px;font-size:7px}
+  .sc-posts,.sc-assistant-card{gap:4px;max-height:68px;min-height:0}
+  .sc-posts strong,.sc-assistant-card strong{font-size:7px}
+  .sc-posts a,.sc-assistant-card span{gap:1px;padding:4px 5px;border-radius:6px;font-size:7px;line-height:1.25}
+  .sc-posts time,.sc-posts em{font-size:6px;line-height:1.25}
+  .sc-consent-card header{gap:4px!important;padding:14px 16px 5px!important}
+  .sc-consent-card header span::before{font-size:9px!important}
+  .sc-consent-card header strong{font-size:15px!important;line-height:1.3!important}
+  .sc-consent-body{padding:6px 16px 12px!important}
+  .sc-consent-body :deep(h2){margin:14px 0 6px!important;font-size:12px!important}
+  .sc-consent-body :deep(h3){margin:10px 0 4px!important;font-size:10px!important}
+  .sc-consent-body :deep(p){margin:5px 0!important;font-size:9px!important;line-height:1.55!important}
+  .sc-consent-body :deep(ul){margin:5px 0 9px!important;padding-left:15px!important}
+  .sc-consent-body :deep(li){margin:3px 0!important;font-size:9px!important;line-height:1.5!important}
+  .sc-consent-card footer{padding:6px 16px 12px!important}
+  .sc-consent-card footer>.sc-consent-status.is-readable{font-size:8px!important;line-height:1.4!important}
+  .sc-consent-card footer button{height:29px!important;min-width:118px!important;border-radius:8px!important}
+  .sc-consent-card footer button:not(.is-secondary)::before{font-size:9px!important}
+}
 </style>

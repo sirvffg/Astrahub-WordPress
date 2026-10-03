@@ -28,7 +28,7 @@ class WP_AstraHub_Node_Selector {
      */
     const DEFAULT_NODES = array(
         'https://astra.zzrbk.xyz',
-        'https://astra.rinty.xyz',
+        'https://astra.rinty.cn',
         'https://astra.fryfries13.cn',
         'https://astra.lygalaxy.cn',
         'https://astra.aobp.cn',
@@ -97,6 +97,7 @@ class WP_AstraHub_Node_Selector {
 
         // 如果当前节点在 TTL 内，且存在，直接返回。
         if ( ! empty( $snapshot['currentNode'] )
+            && in_array( $snapshot['currentNode'], $this->nodes(), true )
             && ! empty( $snapshot['selectedAt'] )
             && ( $now - (int) $snapshot['selectedAt'] ) < self::SELECTION_TTL ) {
             return (string) $snapshot['currentNode'];

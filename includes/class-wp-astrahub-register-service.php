@@ -21,6 +21,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class WP_AstraHub_Register_Service {
 
+    public function hub_base_url() {
+        return $this->hub_client->base_url();
+    }
+
     /**
      * Hub 客户端。
      *

@@ -17,6 +17,7 @@ export interface WorldChatMemberSummary {
   url: string;
   category?: string;
   avatarUrl?: string;
+  checkinDays?: number;
   joinedAt?: string;
   updatedAt?: string;
 }
